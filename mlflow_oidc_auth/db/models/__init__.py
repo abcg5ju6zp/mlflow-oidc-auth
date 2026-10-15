@@ -24,7 +24,15 @@ from mlflow_oidc_auth.db.models.gateway_secret import (
 )
 from mlflow_oidc_auth.db.models.mcp_server import SqlMCPServerGroupPermission, SqlMCPServerPermission
 from mlflow_oidc_auth.db.models.identity import SqlAuthSession, SqlAuthState, SqlUserIdentity
-from mlflow_oidc_auth.db.models.scim import SqlScimActivity, SqlScimToken
+from mlflow_oidc_auth.db.models.scim import (
+    GROUP_CHANGE_APPLYING,
+    GROUP_CHANGE_COMPLETED,
+    GROUP_CHANGE_PENDING,
+    GROUP_CHANGE_SUPERSEDED,
+    SqlScimActivity,
+    SqlScimGroupChange,
+    SqlScimToken,
+)
 from mlflow_oidc_auth.db.models.saml import SqlSamlAssertion
 from mlflow_oidc_auth.db.models.user import SqlUser, SqlGroup, SqlUserGroup
 from mlflow_oidc_auth.db.models.user_token import SqlUserToken
@@ -58,6 +66,11 @@ __all__ = [
     "SqlAuthState",
     "SqlScimToken",
     "SqlScimActivity",
+    "SqlScimGroupChange",
+    "GROUP_CHANGE_PENDING",
+    "GROUP_CHANGE_APPLYING",
+    "GROUP_CHANGE_COMPLETED",
+    "GROUP_CHANGE_SUPERSEDED",
     "SqlSamlAssertion",
     "SqlExperimentPermission",
     "SqlExperimentGroupPermission",

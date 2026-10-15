@@ -82,6 +82,10 @@ class SqlGroup(Base):
     # that predates the column), ``scim``, or ``oidc:<id>`` / ``saml:<id>`` for a group a login
     # created. SCIM may write only groups it owns under ``enforce``.
     managed_by: Mapped[str] = mapped_column(String(255), nullable=False, server_default="manual", default="manual")
+    # The directory version (SCIM ``directoryVersion``) of the last completed versioned group
+    # change. NULL for groups never written with a version — every pre-existing row, and every
+    # unversioned write. The optimistic-concurrency base a versioned change is planned against.
+    current_version: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     # Nullable at the DB level: they are added to an existing table, and SQLite refuses
     # ADD COLUMN with a non-constant default once the table has rows. The migration backfills
     # existing rows; ``default`` populates new ones.

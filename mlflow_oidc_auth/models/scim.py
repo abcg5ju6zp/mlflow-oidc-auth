@@ -15,6 +15,10 @@ SCIM_CONTENT_TYPE = "application/scim+json"
 
 USER_SCHEMA = "urn:ietf:params:scim:schemas:core:2.0:User"
 GROUP_SCHEMA = "urn:ietf:params:scim:schemas:core:2.0:Group"
+#: Custom extension carrying the directory's monotonic version for a versioned, recoverable group
+#: change. Accepted as ``directoryVersion`` on a Group body/PATCH value (top level or in this
+#: extension object) and echoed on read when the group holds a current version.
+DIRECTORY_GROUP_EXTENSION = "urn:ietf:params:scim:schemas:extension:mlflow-oidc:2.0:Group"
 LIST_RESPONSE_SCHEMA = "urn:ietf:params:scim:api:messages:2.0:ListResponse"
 PATCH_OP_SCHEMA = "urn:ietf:params:scim:api:messages:2.0:PatchOp"
 ERROR_SCHEMA = "urn:ietf:params:scim:api:messages:2.0:Error"

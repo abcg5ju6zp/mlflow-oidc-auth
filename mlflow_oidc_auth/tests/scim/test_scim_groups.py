@@ -131,10 +131,16 @@ class TestDiscovery:
 
         schema = client.get(f"/scim/v2/Schemas/{GROUP_SCHEMA}", headers=scim).json()
         attributes = {a["name"]: a for a in schema["attributes"]}
-        assert attributes["displayName"]["mutability"] == "immutable"
+        # readWrite at the schema level: without directoryVersion + externalId the server still
+        # answers a rename with 400 mutability (covered in the rename-gate suite).
+        assert attributes["displayName"]["mutability"] == "readWrite"
         assert {s["name"] for s in attributes["members"]["subAttributes"]} == {"value", "$ref", "type"}
         listed = client.get("/scim/v2/Schemas", headers=scim).json()
-        assert {r["id"] for r in listed["Resources"]} == {GROUP_SCHEMA, "urn:ietf:params:scim:schemas:core:2.0:User"}
+        assert {r["id"] for r in listed["Resources"]} == {
+            GROUP_SCHEMA,
+            "urn:ietf:params:scim:schemas:core:2.0:User",
+            "urn:ietf:params:scim:schemas:extension:mlflow-oidc:2.0:Group",
+        }
 
     def test_groups_need_the_scim_token(self, client, bound_store, admin):
         response = client.get(GROUPS)

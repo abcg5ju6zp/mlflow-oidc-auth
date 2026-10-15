@@ -100,10 +100,29 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             "OIDC authentication will not be available until configuration is corrected."
         )
 
+    # Reconcile interrupted versioned SCIM group changes (pending rows wait for a same-key retry;
+    # nothing is auto-applied). Best effort: never blocks serving.
+    _recover_group_changes_at_startup()
+
     yield  # App runs here
 
     # Shutdown: Cleanup if needed
     logger.info("Shutting down MLflow OIDC Auth Plugin...")
+
+
+def _recover_group_changes_at_startup() -> None:
+    """Reconcile versioned SCIM group changes interrupted by a crash or restart.
+
+    Best effort by contract: it never blocks startup and never raises. Only ``applying`` ledger
+    rows are reconciled (completed when the group reached the target, back to ``pending``
+    otherwise); no pending change is auto-applied — the directory's same-key retry drives those.
+    """
+    try:
+        from mlflow_oidc_auth.store import store
+
+        store.recover_scim_group_changes()
+    except Exception as e:
+        logger.warning("SCIM group-change recovery did not run: %s", e)
 
 
 def _seed_default_workspace() -> None:

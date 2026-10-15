@@ -210,12 +210,19 @@ permissions ([Permissions](permissions)), so this is where the directory's acces
 
 ### Identifiers
 
-A group's SCIM `id` is its **name**, as a user's is their username. `displayName` is therefore
-immutable through SCIM: a `PUT` or `PATCH` that changes it gets `400 mutability`. To rename a
-group, create a new one. Group names are **case-sensitive**, because they are compared with IdP
-group claims exactly as the IdP sends them. A new `displayName` follows the same rules as a
-`userName`, except that it is not case-folded. It may not be empty or longer than 255
-characters, contain control characters, or contain `/`, `?`, `#` or `%`.
+A group's SCIM `id` is its **name**, as a user's is their username. Group names are
+**case-sensitive**, because they are compared with IdP group claims exactly as the IdP sends
+them. A new `displayName` follows the same rules as a `userName`, except that it is not
+case-folded. It may not be empty or longer than 255 characters, contain control characters, or
+contain `/`, `?`, `#` or `%`.
+
+Changing the name changes the id, so a rename through SCIM is allowed only as a **versioned
+change**: the request carries the directory's monotonic `directoryVersion` (see
+[Versioned changes](#versioned-changes-and-recovery)) and the group holds a non-empty
+`externalId`. A `PUT`/`PATCH` that changes `displayName` without both keeps getting
+`400 mutability`; to rename a group without versions, create a new one. Memberships and every
+permission granted to the group reference its stable internal id, so a versioned rename keeps
+all grants and members.
 
 `externalId` is stored on the group (`groups.external_id`, unique when present). As for users,
 it is **not** an id. `/Groups/{id}` resolves the name only, and a client that knows only the
@@ -240,9 +247,9 @@ added, and a `PUT` never removes them.
 | GET | `/Groups` | `filter` supports only `displayName eq "..."` and `externalId eq "..."`. `startIndex` / `count` as for users. `excludedAttributes=members` omits members |
 | GET | `/Groups/{id}` | `excludedAttributes=members` supported |
 | POST | `/Groups` | `displayName` required. `externalId` and `members` optional |
-| PUT | `/Groups/{id}` | Okta's shape. `displayName` must be unchanged. `externalId` is replaced, and an absent one is cleared. `members` replaces the membership as a sync (below). **An omitted `members` leaves membership unchanged**, so a PUT carrying only attributes never empties a group |
-| PATCH | `/Groups/{id}` | See below |
-| DELETE | `/Groups/{id}` | Removes the group, its memberships and every permission granted to it. See [Deleting a group](#deleting-a-group) |
+| PUT | `/Groups/{id}` | Okta's shape. `externalId` is replaced, and an absent one is cleared. `members` replaces the membership as a sync (below). **An omitted `members` leaves membership unchanged**, so a PUT carrying only attributes never empties a group. Without `directoryVersion` `displayName` must be unchanged; with it plus an `externalId` the group is renamed atomically (see [Versioned changes](#versioned-changes-and-recovery)) |
+| PATCH | `/Groups/{id}` | See below; `replace` of `displayName` is a rename on the versioned path only |
+| DELETE | `/Groups/{id}` | Removes the group, its memberships and every permission granted to it. Refused while a versioned change for the group has not settled. See [Deleting a group](#deleting-a-group) |
 
 **PATCH.** Operations apply in order, in one transaction. `op` is case-insensitive
 (`Add`/`Remove`/`Replace`, as Entra sends them), and paths may be URN-qualified.
@@ -255,13 +262,64 @@ added, and a `PUT` never removes them.
 | Remove every member | `{"op": "remove", "path": "members"}` | |
 | Replace members | `{"op": "replace", "path": "members", "value": [...]}` | |
 | Set or clear `externalId` | `add` / `replace` / `remove` on `externalId` | |
-| No path | `{"op": "replace", "value": {"displayName": ..., "externalId": ..., "members": [...]}}` | Entra |
+| Set the directory version | `replace` / `add` on `directoryVersion` (or the extension object, below) | |
+| Rename | `replace` on `displayName` together with `directoryVersion` and an `externalId` | |
+| No path | `{"op": "replace", "value": {"displayName": ..., "externalId": ..., "members": [...], "directoryVersion": ...}}` | Entra |
 
-`displayName` (and `id`) may be re-asserted unchanged. Anything else gets `400` and **none** of
-the request's operations are applied: any other path (`invalidPath`), a filter other than
-`members[value eq "..."]`, a filtered path with `add` or `replace`, a sub-attribute after the
-filter such as `members[value eq "x"].display`, or another `op`. Removing a user who is not a
-member does nothing and is not an error.
+`displayName` (and `id`) may be re-asserted unchanged. A changed `displayName` needs
+`directoryVersion` + `externalId`; without them it is `400 mutability`. Anything else gets
+`400` and **none** of the request's operations are applied: any other path (`invalidPath`), a
+filter other than `members[value eq "..."]`, a filtered path with `add` or `replace`, a
+sub-attribute after the filter such as `members[value eq "x"].display`, or another `op`.
+Removing a user who is not a member does nothing and is not an error.
+
+### Versioned changes and recovery
+
+A write carrying `directoryVersion` opts into the recoverable path. The version is the
+directory's monotonic value for the group (`10` sorts after `9`; when either side is not an
+integer, versions order lexicographically). It travels either as a top-level
+`directoryVersion` attribute or inside the extension schema
+`urn:ietf:params:scim:schemas:extension:mlflow-oidc:2.0:Group`:
+
+```json
+{
+  "schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group",
+              "urn:ietf:params:scim:schemas:extension:mlflow-oidc:2.0:Group"],
+  "displayName": "eng-new",
+  "externalId": "okta-1",
+  "directoryVersion": "42",
+  "members": [{"value": "alice@example.com"}]
+}
+```
+
+For every versioned change the server first persists a ledger row holding the externalId, the
+version, the base version it was planned on, the old and new names, and the member diff; only
+then does it rename the group, apply the membership operations and advance the group's version
+— all in one transaction. The rules are:
+
+- **Idempotent.** `(externalId, directoryVersion)` identifies the change. Repeating a completed
+  request — including against the **old name** after a rename — returns the same completed
+  group (`200`) without rewriting anything or emitting a second audit event.
+- **Concurrent PATCHes conflict, never overwrite.** A request whose base version is no longer
+  current gets `409 versionConflict`; re-read and retry. A strictly older version is refused the
+  same way; re-asserting the current version is a no-op `200`. The losing request's ledger row
+  closes as `superseded` (its retries stay `409`) and does not block a later group delete.
+- **Replay returns that change's result.** A repeated key returns the group as it was when *that*
+  version settled, not whatever a later version made it. The ledger correlates per group via the
+  group's current externalId, so reusing a released externalId for a new group starts that group's
+  own version chain without replaying the old holder's history.
+- **Failures stay recoverable.** An unknown member is `400 invalidValue` and changes nothing —
+  no ledger row settles and no membership moves. A failure inside the apply transaction rolls
+  everything back: the group keeps its old name, membership and grants, the ledger row stays
+  `pending` (with an attempt count and the error), and the identical request continues it.
+- **Restarts reconcile.** At startup, changes found mid-`applying` are completed when the group
+  already reached the target or returned to `pending` for a retry. Pending changes are never
+  auto-applied; the directory's same-key request resumes them.
+- **Delete waits.** `DELETE` is refused with `409` while a change for the group is still open.
+
+A versioned group read echoes the extension with `directoryVersion` (the group's current
+version). Requests without `directoryVersion` keep the legacy, single-transaction behavior
+exactly.
 
 ### Group ownership
 
@@ -348,15 +406,18 @@ SCIM membership never grants administrator rights, even in a group named in
 granted to the group (experiments, models and prompts, scorers, gateway resources, workspaces,
 regex grants included). If you recreate a group with the same name, it starts with no grants.
 
-Two checks run first, in this order:
+Three checks run first, in this order:
 
 1. The group's owner, as for every group write: under `enforce` only a `scim`-owned group can be
    deleted.
 2. The group's memberships: if any is not SCIM's, including hand-made (`manual`) ones, the delete
    is refused under `enforce`. Deleting the group would take it away from those members too.
+3. The group has no versioned change still open (`pending`/`applying`): deleting it would strand
+   the directory's retry, so that is a plain `409`; once the change settles the delete proceeds
+   and the completed ledger rows are removed with the group.
 
-Either refusal is `409 mutability` with nothing removed. Under `report` the delete proceeds and
-records each conflict (`group.ownership_conflict` for the group,
+Either ownership refusal is `409 mutability` with nothing removed. Under `report` the delete
+proceeds and records each conflict (`group.ownership_conflict` for the group,
 `user.ownership_conflict` with `detail.operation: "group.delete"` for memberships).
 
 A group delete is never refused because it would leave resources without a manager. The
@@ -367,7 +428,13 @@ table).
 
 On top of the `scim.request` event every SCIM request emits, group writes emit `group.create`
 (members), `group.members_changed` (`added`, `removed`, and `kept`, the rows the guard left in
-place), `group.external_id_set` and `group.delete` (`members_removed`, `grants_removed`).
+place), `group.external_id_set`, `group.renamed` (`from`, `to`) and `group.delete`
+(`members_removed`, `grants_removed`). A versioned change emits its `group.renamed`,
+`group.members_changed` and `group.external_id_set` events exactly once — when the change
+settles — and each carries `detail.version`; an idempotent replay emits nothing. The per-request
+activity row carries the same value as `resource_version` once the request's outcome is
+determined (completed, replayed, conflict, or refused); pre-planning failures (bad syntax,
+unknown group) leave it empty.
 
 Errors use the RFC 7644 §3.12 shape with content type `application/scim+json`:
 
@@ -448,6 +515,7 @@ add up to.
 | `method` | The HTTP method |
 | `path` | The route **template**, such as `/Users/{user_id}`, never the concrete path |
 | `resource_id` | The SCIM `id` the request addressed (a username or group name), when it addressed one |
+| `resource_version` | The directory version a versioned group write settled on — present only once the outcome is determined (completed, replayed, conflict, refused); empty for non-versioned requests and pre-planning failures |
 | `status` | The HTTP status returned |
 | `outcome` | `ok` (below 400), `client_error` (4xx), `server_error` (5xx), or `auth_failed` (no valid token) |
 | `error` | For a failure, the SCIM `scimType: detail` text, capped at 500 characters |

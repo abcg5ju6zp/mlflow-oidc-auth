@@ -60,6 +60,7 @@ class ScimActivityEntry:
     outcome: str
     error: Optional[str]
     duration_ms: Optional[int]
+    resource_version: Optional[str] = None
 
     def to_json(self) -> Dict[str, Any]:
         return {
@@ -74,6 +75,7 @@ class ScimActivityEntry:
             "outcome": self.outcome,
             "error": self.error,
             "duration_ms": self.duration_ms,
+            "resource_version": self.resource_version,
         }
 
 
@@ -90,6 +92,7 @@ def _entry(row: SqlScimActivity) -> ScimActivityEntry:
         outcome=row.outcome,
         error=row.error,
         duration_ms=row.duration_ms,
+        resource_version=row.resource_version,
     )
 
 
@@ -122,6 +125,7 @@ class ScimActivityRepository:
         outcome: str,
         error: Optional[str],
         duration_ms: Optional[int],
+        resource_version: Optional[str] = None,
         at: Optional[datetime] = None,
     ) -> None:
         """Insert one row. Every free-text field is clipped to its column."""
@@ -138,6 +142,7 @@ class ScimActivityRepository:
                     outcome=outcome,
                     error=_clip(error, MAX_ERROR_LENGTH),
                     duration_ms=duration_ms,
+                    resource_version=_clip(resource_version, 255),
                 )
             )
             session.flush()

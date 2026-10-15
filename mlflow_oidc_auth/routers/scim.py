@@ -49,6 +49,7 @@ from mlflow_oidc_auth.config import config
 from mlflow_oidc_auth.dependencies import ScimRateLimiter, check_admin_permission, require_scim_token
 from mlflow_oidc_auth.logger import get_logger
 from mlflow_oidc_auth.models.scim import (
+    DIRECTORY_GROUP_EXTENSION,
     GROUP_SCHEMA,
     PATCH_OP_SCHEMA,
     RESOURCE_TYPE_SCHEMA,
@@ -69,6 +70,7 @@ from mlflow_oidc_auth.models.scim import (
 from mlflow_oidc_auth.orphans import delete_user_reporting_orphans, report_orphans
 from mlflow_oidc_auth.ownership import MANUAL
 from mlflow_oidc_auth.repository.group import UnknownMember
+from mlflow_oidc_auth.repository.scim_group_change import GroupChangeBlocked, GroupVersionConflict, SameVersion, record_result_detail
 from mlflow_oidc_auth.repository.scim_activity import MAX_PAGE_SIZE as MAX_ACTIVITY_PAGE_SIZE, OUTCOMES, outcome_for
 from mlflow_oidc_auth.store import store
 from mlflow_oidc_auth.workspace_rules import apply_rules_for_groups
@@ -200,6 +202,9 @@ async def _record_activity(request: Request, status_code: int, detail: Optional[
             "outcome": outcome_for(status_code, authenticated=token is not None),
             "error": _activity_error(status_code, detail, scim_type),
             "duration_ms": int((time.monotonic() - started) * 1000),
+            # Set only once a versioned group change reached a determined outcome (see the group
+            # write orchestrator); absent for non-versioned requests and pre-planning failures.
+            "resource_version": getattr(request.state, "scim_group_version", None),
         }
         await asyncio.get_running_loop().run_in_executor(None, _write_activity, fields)
     except Exception:
@@ -577,10 +582,14 @@ _GROUP_SCHEMA_DEFINITION = {
             "multiValued": False,
             "required": True,
             "caseExact": True,
-            "mutability": "immutable",
+            "mutability": "readWrite",
             "returned": "default",
             "uniqueness": "server",
-            "description": "The group name, compared with IdP group claims as-is. Also the SCIM id.",
+            "description": (
+                "The group name, compared with IdP group claims as-is. Also the SCIM id, so changing it changes the id: "
+                "a rename is accepted only when the request carries a directoryVersion and the group holds a non-empty "
+                "externalId to correlate the change and its retries; otherwise the server returns 400 mutability."
+            ),
         },
         {
             "name": "externalId",
@@ -708,7 +717,37 @@ async def scim_resource_type(resource_type: str, request: Request) -> JSONRespon
     return scim_response(build(request))
 
 
-_SCHEMAS = {USER_SCHEMA: _USER_SCHEMA_DEFINITION, GROUP_SCHEMA: _GROUP_SCHEMA_DEFINITION}
+_DIRECTORY_GROUP_EXTENSION_DEFINITION = {
+    "schemas": [SCHEMA_SCHEMA],
+    "id": DIRECTORY_GROUP_EXTENSION,
+    "name": "DirectoryGroup",
+    "description": "Directory coordination extension for versioned, recoverable group changes.",
+    "attributes": [
+        {
+            "name": "directoryVersion",
+            "type": "string",
+            "multiValued": False,
+            "required": False,
+            "caseExact": True,
+            "mutability": "readWrite",
+            "returned": "default",
+            "uniqueness": "none",
+            "description": (
+                "The directory's monotonic version for this group. With an externalId it opts a PUT/PATCH into the "
+                "versioned path: the same externalId+version is an idempotent replay, an older version is a 409 "
+                "versionConflict, and an unfinished change is resumed after a lost response or restart."
+            ),
+        }
+    ],
+    "meta": {"resourceType": "Schema", "location": f"{SCIM_ROUTER_PREFIX}/Schemas/{DIRECTORY_GROUP_EXTENSION}"},
+}
+
+
+_SCHEMAS = {
+    USER_SCHEMA: _USER_SCHEMA_DEFINITION,
+    GROUP_SCHEMA: _GROUP_SCHEMA_DEFINITION,
+    DIRECTORY_GROUP_EXTENSION: _DIRECTORY_GROUP_EXTENSION_DEFINITION,
+}
 
 
 @scim_router.get("/Schemas", summary="SCIM schemas")
@@ -951,7 +990,12 @@ def _to_scim_group(detail: Dict[str, Any], request: Request) -> Dict[str, Any]:
             location=_group_location(request, detail["group_name"]),
         ),
     )
-    return group.to_wire()
+    wire = group.to_wire()
+    current_version = detail.get("current_version")
+    if current_version:
+        wire["schemas"].append(DIRECTORY_GROUP_EXTENSION)
+        wire[DIRECTORY_GROUP_EXTENSION] = {"directoryVersion": current_version}
+    return wire
 
 
 def _require_group(group_id: str, *, with_members: bool = True) -> Dict[str, Any]:
@@ -1041,6 +1085,10 @@ def _excludes_members(excluded_attributes: Optional[str]) -> bool:
 def _raise_for_group_store_error(exc: MlflowException, group_id: str) -> None:
     if isinstance(exc, UnknownMember):
         raise ScimHTTPError(400, f"member {exc.username} is not a known user", "invalidValue")
+    if isinstance(exc, GroupVersionConflict):
+        raise ScimHTTPError(409, exc.message, "versionConflict")
+    if isinstance(exc, GroupChangeBlocked):
+        raise ScimHTTPError(409, exc.message)
     code = exc.error_code
     if code == ErrorCode.Name(RESOURCE_DOES_NOT_EXIST):
         raise ScimHTTPError(404, f"Group {group_id} not found")
@@ -1053,22 +1101,179 @@ def _raise_for_group_store_error(exc: MlflowException, group_id: str) -> None:
     raise ScimHTTPError(500, "Internal error")
 
 
-def _audit_membership_change(request: Request, group_name: str, outcome) -> None:
+def _audit_membership_change(request: Request, group_name: str, outcome, version: Optional[str] = None) -> None:
     """One ``group.members_changed`` event per write that changed membership, after the commit."""
     if outcome is None or not outcome.changed:
         return
+    detail = {
+        "source": SCIM_SOURCE,
+        "added": [username for username, _ in outcome.added],
+        "removed": [username for username, _ in outcome.removed],
+        "kept": [c.username for c in outcome.refused],
+    }
+    if version is not None:
+        detail["version"] = version
     emit_audit_event(
         "group.members_changed",
         actor=_actor(request),
         resource_type="group",
         resource_id=group_name,
-        detail={
-            "source": SCIM_SOURCE,
-            "added": [username for username, _ in outcome.added],
-            "removed": [username for username, _ in outcome.removed],
-            "kept": [c.username for c in outcome.refused],
-        },
+        detail=detail,
     )
+
+
+# ---------------------------------------------------------------------------------------------
+# Versioned group writes (directoryVersion): plan -> atomic apply -> idempotent replay
+# ---------------------------------------------------------------------------------------------
+
+MAX_DIRECTORY_VERSION_LENGTH = 255
+
+
+def _directory_version_from_value(value: Any) -> Optional[str]:
+    """Validate one ``directoryVersion`` scalar: a stripped, non-empty string of <= 255 chars."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ScimHTTPError(400, "directoryVersion must be a non-empty string", "invalidValue")
+    version = value.strip()
+    if len(version) > MAX_DIRECTORY_VERSION_LENGTH:
+        raise ScimHTTPError(400, f"directoryVersion must be at most {MAX_DIRECTORY_VERSION_LENGTH} characters", "invalidValue")
+    return version
+
+
+def _directory_version_from_object(body: Dict[str, Any]) -> Optional[str]:
+    """Read ``directoryVersion`` from a PUT/POST object: top level, or in the extension object."""
+    if "directoryVersion" in body:
+        return _directory_version_from_value(body["directoryVersion"])
+    extension = body.get(DIRECTORY_GROUP_EXTENSION)
+    if isinstance(extension, dict) and "directoryVersion" in extension:
+        return _directory_version_from_value(extension["directoryVersion"])
+    return None
+
+
+def _tag_settled_version(request: Request, version: str) -> None:
+    """Mark the version this request's outcome was determined on, for the activity log."""
+    request.state.scim_group_version = version
+
+
+def _result_detail(record) -> Dict[str, Any]:
+    """The renderable group detail from a completed ledger record's snapshot."""
+    return record_result_detail(record)
+
+
+def _apply_versioned_group_write(
+    request: Request,
+    path_name: str,
+    *,
+    new_name: Optional[str],
+    operations,
+    external_id: Any,
+    external_id_provided: bool,
+    version: str,
+) -> Dict[str, Any]:
+    """The versioned path for PUT/PATCH group writes, including rename and idempotent retries.
+
+    ``external_id`` is the resulting external id for PUT (always provided, may be None) or for a
+    PATCH that sets/removes it; ``external_id_provided`` distinguishes that from a PATCH that never
+    touched it (the group's current external id is then the key).
+
+    Resolution order: an existing ledger row for ``(externalId, version)`` is replayed when
+    completed or resumed when open; otherwise a new change is planned and applied. A request that
+    misses the path after a rename is matched by its ledger key (or, for a PATCH carrying no
+    externalId, by version plus the old name).
+    """
+    token = getattr(request.state, "scim_token", None)
+    token_id = token.id if token is not None else None
+
+    detail = store.get_group_detail(path_name, with_members=False)
+    record = None
+    if external_id_provided and external_id:
+        record = store.get_scim_group_change(external_id, version)
+
+    if detail is None:
+        if record is None:
+            # Retry against the old name after a rename: fall back to an unambiguous (version, old
+            # name) match when the body carries no usable externalId.
+            record = store.find_scim_group_change(version=version, old_name=path_name)
+        if record is None or (record.old_name != path_name and record.new_name != path_name):
+            # No ledger row belongs to the name on the path: never replay another group's result.
+            raise ScimHTTPError(404, f"Group {path_name} not found")
+        detail = store.get_group_detail_by_id(record.group_id, with_members=False)
+        if detail is None:
+            raise ScimHTTPError(404, f"Group {path_name} not found")
+    elif record is not None:
+        # The path resolved to a group: the ledger key must belong to THIS group. An externalId
+        # historically reused by another group can otherwise make a request replay a foreign
+        # resource; a mismatch is treated as "no change yet" and re-validated below.
+        bound = store.get_group_detail_by_id(record.group_id, with_members=False)
+        if bound is None or bound["group_name"] != detail["group_name"]:
+            record = None
+    _tag_settled_version(request, version)
+
+    rename = new_name is not None and new_name != detail["group_name"]
+    if rename and any(ch in GROUP_NAME_RESERVED_CHARS for ch in new_name):
+        raise ScimHTTPError(400, "displayName must not contain '/', '?', '#' or '%'", "invalidValue")
+    if not external_id_provided:
+        effective_external_id = detail.get("external_id")
+    else:
+        effective_external_id = external_id or None
+    if rename and not effective_external_id:
+        # A rename is replayable only with a stable directory key: keep the old 400 mutability
+        # answer when the request cannot be correlated after the id changes.
+        raise ScimHTTPError(400, "displayName is immutable; a rename needs a non-empty externalId with directoryVersion", "mutability")
+    if not rename and not effective_external_id:
+        raise ScimHTTPError(400, "directoryVersion requires a non-empty externalId for the group", "invalidValue")
+
+    target_name = new_name or detail["group_name"]
+
+    if record is None:
+        try:
+            record = store.plan_scim_group_change(
+                detail["group_name"],
+                version=version,
+                target_external_id=effective_external_id,
+                new_name=target_name,
+                operations=operations,
+                written_by=SCIM_SOURCE,
+                actor=_actor(request),
+                token_id=token_id,
+            )
+        except SameVersion:
+            # Re-asserting the current version with no ledger row: idempotent no-op, current state.
+            return store.get_group_detail(detail["group_name"])
+        except MlflowException as exc:
+            _raise_for_group_store_error(exc, path_name)
+
+    if record.is_completed:
+        # Replay the settled result itself (not live state): a later version must not rewrite the
+        # body the directory gets for THIS key.
+        return _result_detail(record)
+
+    try:
+        outcome, updated, completed, settled_now = store.apply_scim_group_change(record.id, written_by=SCIM_SOURCE, actor=_actor(request))
+    except MlflowException as exc:
+        _raise_for_group_store_error(exc, path_name)
+
+    if settled_now:
+        if completed.old_name != completed.new_name:
+            emit_audit_event(
+                "group.renamed",
+                actor=_actor(request),
+                resource_type="group",
+                resource_id=completed.new_name,
+                detail={"source": SCIM_SOURCE, "from": completed.old_name, "to": completed.new_name, "version": version},
+            )
+        _audit_membership_change(request, completed.new_name, outcome, version=version)
+        resulting_external_id = updated.get("external_id")
+        if (completed.from_external_id or None) != (resulting_external_id or None):
+            emit_audit_event(
+                "group.external_id_set",
+                actor=_actor(request),
+                resource_type="group",
+                resource_id=completed.new_name,
+                detail={"source": SCIM_SOURCE, "from": completed.from_external_id, "to": resulting_external_id, "version": version},
+            )
+    return updated
 
 
 def _apply_group_changes(request: Request, detail: Dict[str, Any], operations, external_id: Any = _UNSET) -> Dict[str, Any]:
@@ -1132,11 +1337,13 @@ async def scim_create_group(request: Request) -> JSONResponse:
         raise ScimHTTPError(400, "displayName must not contain '/', '?', '#' or '%'", "invalidValue")
     external_id = _optional_str(payload.external_id, "externalId")
     members = _member_ids(payload.members)
+    # Optional seed for the directory version chain; never writes a scim_group_changes ledger row.
+    initial_version = _directory_version_from_object(body)
 
     if store.get_group_detail(name, with_members=False) is not None:
         raise ScimHTTPError(409, f"Group {name} already exists", "uniqueness")
     try:
-        detail = store.create_directory_group(name, external_id, members, written_by=SCIM_SOURCE)
+        detail = store.create_directory_group(name, external_id, members, written_by=SCIM_SOURCE, current_version=initial_version)
     except MlflowException as exc:
         _raise_for_group_store_error(exc, name)
 
@@ -1158,26 +1365,43 @@ async def scim_create_group(request: Request) -> JSONResponse:
 async def scim_replace_group(group_id: str, request: Request) -> JSONResponse:
     """Okta's shape: the whole group, ``members`` included.
 
-    ``displayName`` must be unchanged (it is the id). ``externalId`` is replaced, and an absent one
+    ``displayName`` is the id and, without a ``directoryVersion`` + ``externalId``, must be
+    unchanged. With them the versioned path renames the group atomically with the membership sync
+    and the change becomes idempotent and recoverable. ``externalId`` is replaced, and an absent one
     is cleared. ``members`` replaces the membership as a sync: SCIM's own and unowned memberships
     not in the list are removed, another source's are left in place under ``enforce``. An omitted
     ``members`` leaves membership alone, so a PUT that only carries attributes never empties a group.
     """
-    detail = _require_group(group_id, with_members=False)
     body = await _json_body(request)
     try:
         payload = ScimGroupInput.model_validate(body)
     except ValidationError:
         raise ScimHTTPError(400, "displayName is required", "invalidValue")
-    if _group_name(payload.display_name) != detail["group_name"]:
-        raise ScimHTTPError(400, "displayName is immutable", "mutability")
+    desired_name = _group_name(payload.display_name)
+    external_id = _optional_str(payload.external_id, "externalId")
     operations = [] if payload.members is None else [("replace", _member_ids(payload.members))]
-    updated = _apply_group_changes(request, detail, operations, external_id=_optional_str(payload.external_id, "externalId"))
+    version = _directory_version_from_object(body)
+    if version is None:
+        detail = _require_group(group_id, with_members=False)
+        if desired_name != detail["group_name"]:
+            raise ScimHTTPError(400, "displayName is immutable", "mutability")
+        updated = _apply_group_changes(request, detail, operations, external_id=external_id)
+    else:
+        updated = _apply_versioned_group_write(
+            request,
+            group_id,
+            new_name=desired_name,
+            operations=operations,
+            # PUT always replaces externalId (absent clears): the resulting value is always given.
+            external_id=external_id,
+            external_id_provided=True,
+            version=version,
+        )
     return scim_response(_to_scim_group(updated, request))
 
 
-def _group_patch_operations(detail: Dict[str, Any], request_body: Dict[str, Any]):
-    """Translate RFC 7644 §3.5.2 operations on a group into ``(membership operations, externalId)``.
+def _group_patch_operations(detail: Optional[Dict[str, Any]], request_body: Dict[str, Any]):
+    """Translate RFC 7644 §3.5.2 operations on a group into ``(operations, externalId, name, version)``.
 
     Supported, with ``op`` case-insensitive and paths optionally URN-qualified:
 
@@ -1187,10 +1411,15 @@ def _group_patch_operations(detail: Dict[str, Any], request_body: Dict[str, Any]
       every member.
     * ``replace`` ``members`` with a list — a full replacement.
     * ``add`` / ``replace`` / ``remove`` ``externalId``.
-    * ``add`` / ``replace`` ``displayName`` (unchanged only), and a path-less ``add`` / ``replace``
-      whose object holds any of the above.
+    * ``replace``/``add`` ``displayName`` — unchanged re-assertion, or a rename target that only
+      the versioned path accepts.
+    * ``directoryVersion`` (top level, or the mlflow-oidc extension object/path) — opts into the
+      versioned, recoverable path.
+    * a path-less ``add`` / ``replace`` whose object holds any of the above.
 
-    Anything else is refused with 400 and nothing is applied.
+    ``detail`` may be None when the path did not resolve (a rename retry); the id/displayName
+    equality re-checks then simply do not apply. Anything unsupported is refused with 400 and
+    nothing is applied.
     """
     try:
         patch = ScimPatchRequest.model_validate(request_body)
@@ -1199,12 +1428,17 @@ def _group_patch_operations(detail: Dict[str, Any], request_body: Dict[str, Any]
     if PATCH_OP_SCHEMA not in patch.schemas:
         raise ScimHTTPError(400, f"schemas must include {PATCH_OP_SCHEMA}", "invalidSyntax")
 
+    current_name = (detail or {}).get("group_name")
     operations = []
     changes: Dict[str, Any] = {}
 
     def assign(op: str, path: str, value: Any) -> None:
-        key = path[len(_GROUP_URN_PREFIX) :] if path.startswith(_GROUP_URN_PREFIX) else path
-        lowered = key.lower()
+        current_group = current_name
+        if path == f"{DIRECTORY_GROUP_EXTENSION}:directoryVersion":
+            key, lowered = "directoryversion", "directoryversion"
+        else:
+            key = path[len(_GROUP_URN_PREFIX) :] if path.startswith(_GROUP_URN_PREFIX) else path
+            lowered = key.lower()
         filtered = _MEMBER_PATH_FILTER.match(key.strip())
         if filtered:
             if op != "remove":
@@ -1221,10 +1455,17 @@ def _group_patch_operations(detail: Dict[str, Any], request_body: Dict[str, Any]
                 operations.append(("remove", None if value is None else _member_ids(value)))
         elif lowered == "externalid":
             changes["external_id"] = None if op == "remove" else _optional_str(value, "externalId")
+        elif lowered == "directoryversion":
+            if op == "remove":
+                raise ScimHTTPError(400, "directoryVersion cannot be removed", "invalidPath")
+            changes["version"] = _directory_version_from_value(value)
         elif lowered == "displayname":
-            if op == "remove" or _group_name(value) != detail["group_name"]:
-                raise ScimHTTPError(400, "displayName is immutable", "mutability")
-        elif lowered == "id" and op != "remove" and value == detail["group_name"]:
+            if op == "remove":
+                raise ScimHTTPError(400, "displayName is immutable without directoryVersion", "mutability")
+            new_name = _group_name(value)
+            if current_group is None or new_name != current_group:
+                changes["new_name"] = new_name
+        elif lowered == "id" and op != "remove" and (current_group is None or value == current_group):
             pass  # re-asserting the id is harmless
         else:
             raise ScimHTTPError(400, f"Unsupported attribute path {path!r}", "invalidPath")
@@ -1243,15 +1484,36 @@ def _group_patch_operations(detail: Dict[str, Any], request_body: Dict[str, Any]
             for attribute, value in operation.value.items():
                 if attribute == "schemas":
                     continue
+                if attribute == DIRECTORY_GROUP_EXTENSION and isinstance(value, dict) and "directoryVersion" in value:
+                    changes["version"] = _directory_version_from_value(value["directoryVersion"])
+                    continue
                 assign(op, attribute, value)
-    return operations, changes.get("external_id", _UNSET)
+    return operations, changes.get("external_id", _UNSET), changes.get("new_name"), changes.get("version")
 
 
 @scim_router.patch("/Groups/{group_id:path}", summary="Modify a group")
 async def scim_patch_group(group_id: str, request: Request) -> JSONResponse:
-    detail = _require_group(group_id, with_members=False)
-    operations, external_id = _group_patch_operations(detail, await _json_body(request))
-    updated = _apply_group_changes(request, detail, operations, external_id=external_id)
+    body = await _json_body(request)
+    detail = store.get_group_detail(group_id, with_members=False)
+    operations, external_id, new_name, version = _group_patch_operations(detail, body)
+    if version is None:
+        if detail is None:
+            raise ScimHTTPError(404, f"Group {group_id} not found")
+        # The legacy contract: displayName is the immutable id without a directory version.
+        if new_name is not None and new_name != detail["group_name"]:
+            raise ScimHTTPError(400, "displayName is immutable", "mutability")
+        updated = _apply_group_changes(request, detail, operations, external_id=external_id)
+    else:
+        updated = _apply_versioned_group_write(
+            request,
+            group_id,
+            new_name=new_name,
+            operations=operations,
+            external_id=external_id,
+            # A PATCH that never names externalId keeps the group's current one as the ledger key.
+            external_id_provided=external_id is not _UNSET,
+            version=version,
+        )
     return scim_response(_to_scim_group(updated, request))
 
 

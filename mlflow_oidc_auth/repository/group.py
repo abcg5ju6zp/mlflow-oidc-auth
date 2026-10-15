@@ -559,6 +559,7 @@ class GroupRepository:
             "group_name": group.group_name,
             "external_id": group.external_id,
             "managed_by": group.managed_by or MANUAL,
+            "current_version": group.current_version,
             "created_at": group.created_at,
             "updated_at": group.updated_at,
         }
@@ -631,6 +632,17 @@ class GroupRepository:
         _, rows = self.list_group_details_page(group_name=group_name, limit=1, with_members=with_members, include_service_accounts=include_service_accounts)
         return rows[0] if rows else None
 
+    def get_group_detail_by_id(self, group_id: int, *, with_members: bool = True, include_service_accounts: bool = False) -> Optional[dict]:
+        """One group by its stable id, or None. Used by versioned-change retries after a rename."""
+        with self._Session() as session:
+            group = session.query(SqlGroup).filter(SqlGroup.id == group_id).one_or_none()
+            if group is None:
+                return None
+            row = self._group_detail(group)
+            if with_members:
+                row["members"] = self._members_by_group(session, [group.id], include_service_accounts=include_service_accounts)[group.id]
+            return row
+
     @staticmethod
     def _resolve_members(session, usernames: Iterable[str], *, include_service_accounts: bool) -> List[SqlUser]:
         """The user rows for ``usernames``, in order, deduplicated. Raises :class:`UnknownMember`."""
@@ -657,11 +669,12 @@ class GroupRepository:
         if holder is not None and holder[0] != group_id:
             raise MlflowException(f"external id {external_id!r} is already bound to another group", RESOURCE_ALREADY_EXISTS)
 
-    def create_directory_group(self, group_name: str, external_id: Optional[str], members: Sequence[str], *, written_by: str) -> dict:
+    def create_directory_group(self, group_name: str, external_id: Optional[str], members: Sequence[str], *, written_by: str, current_version: Optional[str] = None) -> dict:
         """Create a group and its initial members in one transaction.
 
         Every membership is owned by ``written_by``. Nothing is written if any member is unknown or
-        the name or external id is taken.
+        the name or external id is taken. ``current_version`` seeds the group's directory version
+        when a versioned ``POST`` supplied one; it never writes a ``scim_group_changes`` row.
 
         Raises:
             MlflowException: ``RESOURCE_ALREADY_EXISTS`` for a taken name or external id;
@@ -672,7 +685,7 @@ class GroupRepository:
                 raise MlflowException(f"Group '{group_name}' exists", RESOURCE_ALREADY_EXISTS)
             self._assert_external_id_free(session, external_id, None)
             users = self._resolve_members(session, members, include_service_accounts=False)
-            group = SqlGroup(group_name=group_name, external_id=external_id or None, managed_by=written_by)
+            group = SqlGroup(group_name=group_name, external_id=external_id or None, managed_by=written_by, current_version=current_version or None)
             session.add(group)
             try:
                 session.flush()
@@ -815,6 +828,8 @@ class GroupRepository:
                 :class:`MembershipRefused` when the guard refuses it.
         """
         from mlflow_oidc_auth.db.models import (
+            GROUP_CHANGE_APPLYING,
+            GROUP_CHANGE_PENDING,
             SqlExperimentGroupPermission,
             SqlExperimentGroupRegexPermission,
             SqlGatewayEndpointGroupPermission,
@@ -826,12 +841,14 @@ class GroupRepository:
             SqlMCPServerGroupPermission,
             SqlRegisteredModelGroupPermission,
             SqlRegisteredModelGroupRegexPermission,
+            SqlScimGroupChange,
             SqlScorerGroupPermission,
             SqlScorerGroupRegexPermission,
             SqlWorkspaceGroupPermission,
             SqlWorkspaceGroupRegexPermission,
         )
         from mlflow_oidc_auth.ownership import evaluate_group_delete
+        from mlflow_oidc_auth.repository.scim_group_change import GroupChangeBlocked
 
         outcome = MembershipOutcome()
         grants: Dict[str, int] = {}
@@ -857,7 +874,24 @@ class GroupRepository:
                 if outcome.refused:
                     raise MembershipRefused(outcome, written_by)
 
+                # A versioned directory change that has not settled (the response was lost, the
+                # process crashed, a retry is pending) must not be deleted underneath: its retry
+                # would resume against a missing group. Completed rows are removed with the group.
+                open_change = (
+                    session.query(SqlScimGroupChange.id)
+                    .filter(
+                        SqlScimGroupChange.group_id == group.id,
+                        SqlScimGroupChange.status.in_([GROUP_CHANGE_PENDING, GROUP_CHANGE_APPLYING]),
+                    )
+                    .first()
+                )
+                if open_change is not None:
+                    raise GroupChangeBlocked(group.group_name)
+
                 group_id = group.id
+                # Explicit, same-transaction removal: SQLite does not enforce the FK cascade
+                # unless PRAGMA foreign_keys is on, so do not rely on ON DELETE CASCADE alone.
+                session.query(SqlScimGroupChange).filter(SqlScimGroupChange.group_id == group_id).delete(synchronize_session=False)
                 for model in (
                     SqlExperimentGroupPermission,
                     SqlExperimentGroupRegexPermission,

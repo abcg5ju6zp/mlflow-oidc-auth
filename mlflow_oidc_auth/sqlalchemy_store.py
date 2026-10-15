@@ -1618,9 +1618,17 @@ class SqlAlchemyStore:
         """One group with its members, or None."""
         return self.group_repo.get_group_detail(group_name, **kwargs)
 
-    def create_directory_group(self, group_name: str, external_id: Optional[str], members, *, written_by: str) -> dict:
-        """Create a group and its members, owned by ``written_by``, in one transaction."""
-        return self.group_repo.create_directory_group(group_name, external_id, members, written_by=written_by)
+    def get_group_detail_by_id(self, group_id: int, **kwargs) -> Optional[dict]:
+        """One group by its stable id, or None (versioned-change retries after a rename)."""
+        return self.group_repo.get_group_detail_by_id(group_id, **kwargs)
+
+    def create_directory_group(self, group_name: str, external_id: Optional[str], members, *, written_by: str, current_version: Optional[str] = None) -> dict:
+        """Create a group and its members, owned by ``written_by``, in one transaction.
+
+        ``current_version`` seeds ``groups.current_version`` for a versioned ``POST``; no
+        ``scim_group_changes`` ledger row is written.
+        """
+        return self.group_repo.create_directory_group(group_name, external_id, members, written_by=written_by, current_version=current_version)
 
     def apply_group_changes(self, group_name: str, operations, **kwargs):
         """Apply a directory change set to one group. See :meth:`GroupRepository.apply_group_changes`."""
@@ -1629,6 +1637,42 @@ class SqlAlchemyStore:
     def delete_directory_group(self, group_name: str, **kwargs):
         """Delete a group, its memberships and its grants through the guard."""
         return self.group_repo.delete_directory_group(group_name, **kwargs)
+
+    def _group_change_repo(self):
+        """The versioned group-change ledger repository, created on first use like SCIM repos."""
+        repo = getattr(self, "_scim_group_change_repository", None)
+        if repo is None:
+            from mlflow_oidc_auth.repository.scim_group_change import ScimGroupChangeRepository
+
+            repo = ScimGroupChangeRepository(self.ManagedSessionMaker)
+            self._scim_group_change_repository = repo
+        return repo
+
+    def plan_scim_group_change(self, group_name: str, **kwargs):
+        """Validate and persist a pending versioned group change.
+
+        See :meth:`mlflow_oidc_auth.repository.scim_group_change.ScimGroupChangeRepository.plan`.
+        """
+        return self._group_change_repo().plan(group_name, **kwargs)
+
+    def apply_scim_group_change(self, change_id: int, **kwargs):
+        """Drive a pending versioned group change to completion atomically.
+
+        See :meth:`mlflow_oidc_auth.repository.scim_group_change.ScimGroupChangeRepository.apply`.
+        """
+        return self._group_change_repo().apply(change_id, **kwargs)
+
+    def get_scim_group_change(self, external_id: str, version: str):
+        """The ledger row (if any) for a directory's ``(externalId, version)`` key."""
+        return self._group_change_repo().get_change(external_id, version)
+
+    def find_scim_group_change(self, **kwargs):
+        """Locate a ledger row by version plus old name and/or group id (retry fallbacks)."""
+        return self._group_change_repo().find_change(**kwargs)
+
+    def recover_scim_group_changes(self) -> dict:
+        """Reconcile ``applying`` ledger rows after a restart; never raises."""
+        return self._group_change_repo().recover_interrupted_changes()
 
     def list_group_details(self) -> List[dict]:
         """Every group with its external id and member count, in two column-only statements.
@@ -1841,6 +1885,9 @@ _GROUP_CUD_METHODS = [
     "create_directory_group",
     "apply_group_changes",
     "delete_directory_group",
+    # The versioned rename/membership path: its atomic commit changes membership just like
+    # apply_group_changes, so the same full permission/workspace cache flush applies.
+    "apply_scim_group_change",
 ]
 
 # Group-scoped workspace permission CUD. Invalidation lives here rather than only in
