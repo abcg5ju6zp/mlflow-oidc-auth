@@ -233,7 +233,9 @@ class TestOidcWorkspaceAutoCreate:
 
 @pytest.fixture(autouse=True)
 def in_flight_login_attempt(monkeypatch):
-    """Stand in for the ``auth_state`` row the callback consumes (#316)."""
+    """Stand in for the ``auth_state`` row the callback consumes (#316), pinned to a generation."""
+    from types import SimpleNamespace
+
     from mlflow_oidc_auth.routers import auth as auth_router_mod
     from mlflow_oidc_auth.provider_registry import ProviderConfig, RegistryLoadResult
     from mlflow_oidc_auth.repository.auth_state import AuthAttempt
@@ -241,7 +243,7 @@ def in_flight_login_attempt(monkeypatch):
     monkeypatch.setattr(
         auth_router_mod.store,
         "consume_auth_state",
-        lambda state: AuthAttempt(state=state, provider_id="default") if state else None,
+        lambda state: AuthAttempt(state=state, provider_id="default", credential_generation_id="gen-1") if state else None,
         raising=False,
     )
     monkeypatch.setattr(
@@ -250,6 +252,16 @@ def in_flight_login_attempt(monkeypatch):
         RegistryLoadResult(providers=[ProviderConfig(id="default", type="oidc", audience="mlflow")], errors=[], source="legacy"),
         raising=False,
     )
+    monkeypatch.setattr(
+        auth_router_mod.credential_generations,
+        "get_generation",
+        lambda provider_id, generation_id: SimpleNamespace(provider_id=provider_id, generation_id=generation_id, usable_at=lambda moment=None: True),
+    )
+    def _generation_client(provider_id, generation_id, generation=None):
+        return getattr(auth_router_mod.oauth, "oidc", None)
+
+    monkeypatch.setattr(auth_router_mod.credential_generations, "generation_client", _generation_client)
+    monkeypatch.setattr(auth_router_mod.credential_generations, "usable_pinned_client", _generation_client)
 
     # Identity resolution and provisioning policy (#318) run inside the callback now, so the
     # store has to answer two questions: is this username taken, and is this identity bound.

@@ -98,11 +98,28 @@ class AppConfig:
         from mlflow_oidc_auth.session.token_vault import validate_encryption_key
 
         validate_encryption_key(self.SESSION_TOKEN_ENCRYPTION_KEY)
+        # Dedicated key for the OIDC client secrets stored on credential-generation rows.
+        # Separate from the session-token key by purpose: see credentials/vault.py. Same
+        # comma-separated Fernet key convention; unset derives from SECRET_KEY.
+        self.OIDC_CREDENTIAL_ENCRYPTION_KEY = config_manager.get("OIDC_CREDENTIAL_ENCRYPTION_KEY")
+        from mlflow_oidc_auth.credentials.vault import validate_encryption_key as validate_credential_key
+
+        validate_credential_key(self.OIDC_CREDENTIAL_ENCRYPTION_KEY)
         self.OIDC_CLIENT_SECRET = config_manager.get("OIDC_CLIENT_SECRET")
 
         # Session cookie settings
         self.SESSION_COOKIE_NAME = config_manager.get("SESSION_COOKIE_NAME", "session")
         self.SESSION_COOKIE_MAX_AGE_SECONDS = config_manager.get_int("SESSION_COOKIE_MAX_AGE_SECONDS", default=14 * 24 * 60 * 60) or None
+        # How long a retired OIDC credential generation stays usable after a rotation: long
+        # enough to finish every login already started (the in-flight state lifetime, 15
+        # minutes) and to refresh/revoke every session opened under it (the cookie/session
+        # lifetime). Defaults to the two added together; override explicitly for shorter or
+        # longer overlap windows. See credentials/generations.py.
+        _default_generation_retention = (self.SESSION_COOKIE_MAX_AGE_SECONDS or 14 * 24 * 60 * 60) + 15 * 60
+        self.OIDC_CREDENTIAL_GENERATION_RETENTION_SECONDS = config_manager.get_int(
+            "OIDC_CREDENTIAL_GENERATION_RETENTION_SECONDS",
+            default=_default_generation_retention,
+        )
         _session_cookie_samesite = config_manager.get("SESSION_COOKIE_SAMESITE", "lax").lower()
         if _session_cookie_samesite not in {"lax", "strict", "none"}:
             raise ValueError(f"Invalid SESSION_COOKIE_SAMESITE value: '{_session_cookie_samesite}'")
@@ -152,6 +169,10 @@ class AppConfig:
         # this, a hung IdP can block request threads until the OS-level TCP
         # timeout (~2 minutes), causing cascading auth failures.
         self.OIDC_HTTP_TIMEOUT_SECONDS = config_manager.get_int("OIDC_HTTP_TIMEOUT_SECONDS", default=10)
+        # Time budget for validating freshly rotated credentials before they become the active
+        # generation (discovery fetch and the client-authentication probe). Separate from the
+        # ordinary OIDC HTTP timeout so an operator can bound the rotation request itself.
+        self.OIDC_CREDENTIAL_VALIDATION_TIMEOUT_SECONDS = config_manager.get_int("OIDC_CREDENTIAL_VALIDATION_TIMEOUT_SECONDS", default=10)
         # TLS verification for OIDC discovery/JWKS and the token endpoint. Default True;
         # only disable for providers with self-signed certs in trusted networks.
         self.OIDC_VERIFY_SSL = config_manager.get_bool("OIDC_VERIFY_SSL", default=True)

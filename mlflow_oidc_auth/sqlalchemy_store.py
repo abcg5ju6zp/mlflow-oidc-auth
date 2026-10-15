@@ -69,6 +69,7 @@ from mlflow_oidc_auth.repository import (
     UserIdentityRepository,
     AuthSessionRepository,
     AuthStateRepository,
+    CredentialGenerationRepository,
     WorkspacePermissionRepository,
     WorkspaceGroupPermissionRepository,
 )
@@ -95,6 +96,7 @@ class SqlAlchemyStore:
         self.user_identity_repo = UserIdentityRepository(self.ManagedSessionMaker)
         self.auth_session_repo = AuthSessionRepository(self.ManagedSessionMaker, row_locks=self.db_type != "sqlite")
         self.auth_state_repo = AuthStateRepository(self.ManagedSessionMaker)
+        self.credential_generation_repo = CredentialGenerationRepository(self.ManagedSessionMaker)
         self.saml_assertion_repo = SamlAssertionRepository(self.ManagedSessionMaker)
         self.experiment_repo = ExperimentPermissionRepository(self.ManagedSessionMaker)
         self.experiment_group_repo = ExperimentPermissionGroupRepository(self.ManagedSessionMaker)
@@ -371,12 +373,27 @@ class SqlAlchemyStore:
         """Record how service account ``username`` signs in (see utils/service_accounts.py)."""
         self.user_repo.set_service_account_source(username, source)
 
-    def create_auth_session(self, username: str, expires_at, provider_id: Optional[str] = None, encrypted_tokens: Optional[str] = None) -> str:
+    def create_auth_session(
+        self,
+        username: str,
+        expires_at,
+        provider_id: Optional[str] = None,
+        encrypted_tokens: Optional[str] = None,
+        credential_generation_id: Optional[str] = None,
+    ) -> str:
         """Open a server-side session and return its opaque id (issue #310).
 
         ``encrypted_tokens`` is the session's provider token blob, already encrypted (#367).
+        ``credential_generation_id`` pins the session's later refresh/revocation to the
+        credentials its login used.
         """
-        return self.auth_session_repo.create(username, expires_at, provider_id, encrypted_tokens=encrypted_tokens)
+        return self.auth_session_repo.create(
+            username,
+            expires_at,
+            provider_id,
+            encrypted_tokens=encrypted_tokens,
+            credential_generation_id=credential_generation_id,
+        )
 
     def store_auth_session_tokens(self, session_id: str, encrypted_tokens: Optional[str]) -> bool:
         """Replace a live session's encrypted provider tokens. True if it was updated (#367)."""
@@ -396,6 +413,30 @@ class SqlAlchemyStore:
     def consume_auth_state(self, state: str):
         """Take the login attempt named by ``state``, removing it. None if there is none."""
         return self.auth_state_repo.consume(state)
+
+    def get_active_credential_generation(self, provider_id: str):
+        """The provider's active credential generation, or None when none is bootstrapped."""
+        return self.credential_generation_repo.get_active(provider_id)
+
+    def get_credential_generation(self, provider_id: str, generation_id: str):
+        """A specific generation of a provider, or None."""
+        return self.credential_generation_repo.get(provider_id, generation_id)
+
+    def list_credential_generations(self, provider_id: str):
+        """Every generation of a provider, active first then newest retired first."""
+        return self.credential_generation_repo.list_for_provider(provider_id)
+
+    def bootstrap_credential_generation(self, provider_id: str, **kwargs):
+        """Idempotently create the first active generation for a provider from current config."""
+        return self.credential_generation_repo.bootstrap(provider_id, **kwargs)
+
+    def rotate_credential_generation(self, provider_id: str, **kwargs):
+        """Publish a new active generation, retire the old and prune dead ones, in one txn."""
+        return self.credential_generation_repo.rotate(provider_id, **kwargs)
+
+    def prune_credential_generations(self, provider_id=None, **kwargs):
+        """Physically delete retired generations past their use. Returns deleted ids."""
+        return self.credential_generation_repo.prune_retired(provider_id, **kwargs)
 
     def resolve_auth_session(self, session_id: str):
         """Resolve a session id to its user in one statement, or None if it is not honoured."""

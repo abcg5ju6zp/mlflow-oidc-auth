@@ -59,7 +59,7 @@ async def test_call_authorize_access_token_sync(monkeypatch):
     monkeypatch.setattr(auth_router_mod.oauth, "oidc", types.SimpleNamespace(), raising=False)
     monkeypatch.setattr(auth_router_mod.oauth.oidc, "authorize_access_token", _fake, raising=False)
     req = DummyRequest()
-    res = await auth_router_mod._call_authorize_access_token(req)
+    res = await auth_router_mod._call_authorize_access_token(req, auth_router_mod.oauth.oidc)
     assert res == {"ok": True}
 
 
@@ -75,7 +75,7 @@ async def test_a_bad_signature_refreshes_the_keys_and_reports_itself(monkeypatch
     """
     calls = {"count": 0}
 
-    async def _fake(request, provider_id=None):
+    async def _fake(request, client=None):
         calls["count"] += 1
         raise BadSignatureError("bad")
 
@@ -83,13 +83,13 @@ async def test_a_bad_signature_refreshes_the_keys_and_reports_itself(monkeypatch
 
     refreshed = {"count": 0}
 
-    async def _refresh():
+    async def _refresh(client=None):
         refreshed["count"] += 1
 
     monkeypatch.setattr(auth_router_mod, "_refresh_oidc_jwks", _refresh)
 
     with pytest.raises(BadSignatureError):
-        await auth_router_mod._authorize_access_token_with_key_refresh(DummyRequest())
+        await auth_router_mod._authorize_access_token_with_key_refresh(DummyRequest(), object())
 
     assert calls["count"] == 1, "a second attempt cannot succeed and must not be made"
     assert refreshed["count"] == 1, "the keys are still refreshed, for the next login"
@@ -99,21 +99,18 @@ async def test_a_bad_signature_refreshes_the_keys_and_reports_itself(monkeypatch
 async def test_the_original_error_is_what_propagates(monkeypatch):
     """Not a substitute error produced by a doomed second attempt."""
 
-    async def _fake(request, provider_id=None):
+    async def _fake(request, client=None):
         raise ValueError("invalid_grant: PKCE verification failed")
 
     monkeypatch.setattr(auth_router_mod, "_call_authorize_access_token", _fake)
 
-    async def _refresh():
+    async def _refresh(client=None):
         return None
 
     monkeypatch.setattr(auth_router_mod, "_refresh_oidc_jwks", _refresh)
-    import types
-
-    monkeypatch.setattr(auth_router_mod.oauth, "oidc", types.SimpleNamespace(), raising=False)
 
     with pytest.raises(ValueError, match="invalid_grant"):
-        await auth_router_mod._authorize_access_token_with_key_refresh(DummyRequest())
+        await auth_router_mod._authorize_access_token_with_key_refresh(DummyRequest(), object())
 
 
 def test_build_ui_url_with_and_without_query():
@@ -276,8 +273,9 @@ async def test_callback_success_redirects(monkeypatch):
         return "User@Example.COM", []
 
     monkeypatch.setattr(auth_router_mod, "_process_oidc_callback_fastapi", _fake_proc2)
-    # The callback now opens a server-side session row (#310); the fake user has none.
-    monkeypatch.setattr(auth_router_mod, "_open_server_session", lambda username: "sid-opened")
+    # The callback now opens a server-side session row (#310) pinned to the login's generation;
+    # the fake user has none.
+    monkeypatch.setattr(auth_router_mod, "_open_server_session", lambda username, **kwargs: "sid-opened")
 
     req = DummyRequest()
     # case False -> redirect to base url
@@ -609,10 +607,9 @@ async def test_call_authorize_access_token_sync_implementation(monkeypatch):
     def sync_call(request):
         return {"ok": True}
 
-    monkeypatch.setattr(auth_router_mod.oauth, "oidc", types.SimpleNamespace(), raising=False)
-    monkeypatch.setattr(auth_router_mod.oauth.oidc, "authorize_access_token", sync_call, raising=False)
+    client = types.SimpleNamespace(authorize_access_token=sync_call)
 
-    res = await auth_router_mod._call_authorize_access_token(DummyRequest())
+    res = await auth_router_mod._call_authorize_access_token(DummyRequest(), client)
     assert res == {"ok": True}
 
 
@@ -620,7 +617,7 @@ async def test_call_authorize_access_token_sync_implementation(monkeypatch):
 async def test_a_successful_exchange_does_not_refresh_the_keys(monkeypatch):
     calls = {"count": 0}
 
-    async def _succeed(request, provider_id=None):
+    async def _succeed(request, client=None):
         calls["count"] += 1
         return {"access_token": "x"}
 
@@ -628,12 +625,12 @@ async def test_a_successful_exchange_does_not_refresh_the_keys(monkeypatch):
 
     refreshed = {"count": 0}
 
-    async def _refresh():
+    async def _refresh(client=None):
         refreshed["count"] += 1
 
     monkeypatch.setattr(auth_router_mod, "_refresh_oidc_jwks", _refresh)
 
-    res = await auth_router_mod._authorize_access_token_with_key_refresh(DummyRequest())
+    res = await auth_router_mod._authorize_access_token_with_key_refresh(DummyRequest(), object())
 
     assert res == {"access_token": "x"}
     assert calls["count"] == 1
@@ -691,7 +688,7 @@ async def test_process_oidc_callback_final_except(monkeypatch):
         def get(self, _):
             raise RuntimeError("boom")
 
-    async def fake_exchange(request):
+    async def fake_exchange(request, client=None):
         return BadTokenResponse()
 
     import types
@@ -725,13 +722,18 @@ class TestSessionHandoverOnReLogin:
 
     @staticmethod
     def _exchange(monkeypatch, seen, token_response):
-        async def _fake(request, provider_id=None):
+        async def _fake(request, client=None):
             seen["at_exchange"] = dict(request.session)
             return token_response
 
         monkeypatch.setattr(auth_router_mod, "_authorize_access_token_with_key_refresh", _fake)
-        # A client has to exist for the exchange to be attempted at all.
-        monkeypatch.setattr(auth_router_mod, "get_client", lambda provider_id=None: types.SimpleNamespace(authorize_access_token=_fake), raising=False)
+        # A client has to exist for the exchange to be attempted at all: the pinned generation
+        # materialises it.
+        monkeypatch.setattr(
+            auth_router_mod.credential_generations,
+            "generation_client",
+            lambda provider_id, generation_id, generation=None: types.SimpleNamespace(authorize_access_token=_fake),
+        )
 
     @pytest.mark.asyncio
     async def test_the_previous_session_is_revoked_and_replaced(self, monkeypatch):
@@ -872,6 +874,8 @@ def in_flight_login_attempt(monkeypatch):
     The state machinery itself is tested directly in ``test_auth_state.py`` and
     ``test_provider_login.py``.
     """
+    from types import SimpleNamespace
+
     from mlflow_oidc_auth.routers import auth as auth_router_mod
     from mlflow_oidc_auth.provider_registry import ProviderConfig, RegistryLoadResult
     from mlflow_oidc_auth.repository.auth_state import AuthAttempt
@@ -881,7 +885,7 @@ def in_flight_login_attempt(monkeypatch):
         "consume_auth_state",
         # "unknown-state" stands for a state with no attempt behind it: unknown, already used,
         # or expired. Everything else resolves, so a case can exercise the rest of the callback.
-        lambda state: None if not state or state == "unknown-state" else AuthAttempt(state=state, provider_id="default"),
+        lambda state: None if not state or state == "unknown-state" else AuthAttempt(state=state, provider_id="default", credential_generation_id="gen-1"),
         raising=False,
     )
     monkeypatch.setattr(
@@ -890,6 +894,21 @@ def in_flight_login_attempt(monkeypatch):
         RegistryLoadResult(providers=[ProviderConfig(id="default", type="oidc", audience="mlflow")], errors=[], source="legacy"),
         raising=False,
     )
+    monkeypatch.setattr(
+        auth_router_mod.credential_generations,
+        "get_active_generation",
+        lambda provider_id: SimpleNamespace(generation_id="gen-1"),
+    )
+    monkeypatch.setattr(
+        auth_router_mod.credential_generations,
+        "get_generation",
+        lambda provider_id, generation_id: SimpleNamespace(provider_id=provider_id, generation_id=generation_id, usable_at=lambda moment=None: True),
+    )
+    def _generation_client(provider_id, generation_id, generation=None):
+        return getattr(auth_router_mod.oauth, "oidc", None)
+
+    monkeypatch.setattr(auth_router_mod.credential_generations, "generation_client", _generation_client)
+    monkeypatch.setattr(auth_router_mod.credential_generations, "usable_pinned_client", _generation_client)
 
     # Identity resolution and provisioning policy (#318) run inside the callback now, so the
     # store has to answer two questions: is this username taken, and is this identity bound.

@@ -17,6 +17,7 @@ from fastapi.responses import JSONResponse, RedirectResponse
 
 from mlflow_oidc_auth.audit import emit_audit_event
 from mlflow_oidc_auth.authorization_response import IssuerMismatchError, validate_response_issuer
+from mlflow_oidc_auth.credentials import generations as credential_generations
 from mlflow_oidc_auth.identity_resolution import IdentityDecision, Resolution, resolve_identity
 from mlflow_oidc_auth.provisioning_policy import admin_from_claims, apply_provisioning_policy, groups_to_apply
 from mlflow_oidc_auth.config import config
@@ -39,6 +40,12 @@ logger = get_logger()
 # a row that never expires is a row that can never be swept (#310).
 DEFAULT_SESSION_LIFETIME_SECONDS = 14 * 24 * 60 * 60
 
+# Stable error shown when a callback is bound to a credential generation that can no longer
+# complete it: the generation was purged while the login was in flight, or it passed its
+# retention deadline. The code is never exchanged in that case, so "try again" means a fresh
+# login rather than a second redemption.
+LOGIN_GENERATION_EXPIRED_ERROR = "login_expired"
+
 
 auth_router = APIRouter(
     tags=["auth"],
@@ -60,11 +67,16 @@ async def _maybe_await(result: Any) -> Any:
     return result
 
 
-async def _refresh_oidc_jwks() -> None:
-    """Force a JWKS refresh on the OAuth client to handle key rotation."""
+async def _refresh_oidc_jwks(client=None) -> None:
+    """Force a JWKS refresh on the OAuth client whose exchange just failed, to handle key rotation.
 
-    refresh_fn = getattr(oauth.oidc, "fetch_jwk_set", None)
-    metadata_refresh_fn = getattr(oauth.oidc, "load_server_metadata", None)
+    Scoped to that client — a generation holds its own metadata/JWKS caches — so refreshing one
+    generation never evicts another's keys.
+    """
+
+    target = client or oauth.oidc
+    refresh_fn = getattr(target, "fetch_jwk_set", None)
+    metadata_refresh_fn = getattr(target, "load_server_metadata", None)
 
     try:
         if refresh_fn:
@@ -76,39 +88,21 @@ async def _refresh_oidc_jwks() -> None:
         logger.warning(f"Failed to refresh OIDC JWKS after bad signature: {exc}")
 
 
-async def _call_authorize_access_token(request: Request, provider_id: Optional[str] = None) -> Optional[dict[str, Any]]:
-    """Invoke authorize_access_token while supporting sync or async implementations.
+async def _call_authorize_access_token(request: Request, client) -> Optional[dict[str, Any]]:
+    """Invoke authorize_access_token on the pinned client while supporting sync/async impls.
 
-    The exchange goes to the token endpoint of the provider the attempt started at — never one
-    derived from the response, which is the other half of the RFC 9207 defence.
+    The exchange goes to the token endpoint of the generation the login started at — never one
+    derived from the response (the RFC 9207 defence) and never a different generation's client
+    (the credential-generation defence).
     """
 
-    client = _client_for_exchange(provider_id)
     token_call = client.authorize_access_token(request)  # type: ignore
     return await _maybe_await(token_call)
 
 
-def _client_for_exchange(provider_id: Optional[str]):
-    """The client whose token endpoint an authorization code may be exchanged at.
-
-    A named provider resolves to its own client or to nothing. Falling back to ``oauth.oidc``
-    would post a code minted by one issuer to another issuer's token endpoint, with that other
-    issuer's client id — handing one IdP a credential belonging to a different one, which is the
-    confusion the rest of this flow exists to prevent.
-    """
-    if provider_id and provider_id != DEFAULT_PROVIDER_ID:
-        client = get_client(provider_id)
-        if client is None:
-            raise RuntimeError(f"No registered OAuth client for provider '{provider_id}'")
-        return client
-    # ``default`` keeps resolving to the legacy client, for a deployment that never adopted the
-    # registry.
-    return get_client(DEFAULT_PROVIDER_ID) or oauth.oidc
-
-
 async def _authorize_access_token_with_key_refresh(
     request: Request,
-    provider_id: Optional[str] = None,
+    client,
 ) -> Optional[dict[str, Any]]:
     """Exchange the code for tokens; on failure refresh the JWKS and raise what actually went wrong.
 
@@ -133,29 +127,37 @@ async def _authorize_access_token_with_key_refresh(
     """
 
     try:
-        return await _call_authorize_access_token(request, provider_id)
+        return await _call_authorize_access_token(request, client)
     except BadSignatureError as exc:
         logger.warning("OIDC token exchange failed with bad signature: %s", exc)
         # Most likely a rotated signing key. Refresh so the next login is not affected too.
-        await _refresh_oidc_jwks()
+        await _refresh_oidc_jwks(client)
         raise
     except Exception as exc:
         logger.warning("OIDC token exchange failed: %s", exc)
-        await _refresh_oidc_jwks()
+        await _refresh_oidc_jwks(client)
         raise
 
 
-def _client_for_refresh(provider_id: Optional[str]):
+def _client_for_refresh(provider_id: Optional[str], credential_generation_id: Optional[str] = None):
     """The client whose token endpoint may receive this session's refresh token.
 
-    A refresh token belongs to the issuer that minted it. A session from a named provider is
-    refreshed at that provider or not at all — never at the default one, which would hand one
-    IdP another's credential. Sessions from the default provider, or recorded before the
-    provider was stored, keep using the legacy client.
+    A session recorded a credential generation when it logged in: while that generation is
+    retained, its refresh token and its RFC 7009 revocation go to that generation's client — the
+    credentials the grant was created with. Once the generation has been purged, this falls back
+    to the provider's active client (the client id is normally unchanged by a secret rotation).
+    A refresh or revocation failing there stays best-effort, exactly as before; the *callback*
+    exchange never takes this fallback.
+
+    A refresh token belongs to the issuer that minted it, so a named provider never falls back
+    to the default provider's client.
     """
-    if provider_id and provider_id != DEFAULT_PROVIDER_ID:
-        return get_client(provider_id)
-    return oauth.oidc
+    effective_provider = provider_id or DEFAULT_PROVIDER_ID
+    if credential_generation_id:
+        pinned = credential_generations.usable_pinned_client(effective_provider, credential_generation_id)
+        if pinned is not None:
+            return pinned
+    return get_client(effective_provider) or (oauth.oidc if effective_provider == DEFAULT_PROVIDER_ID else None)
 
 
 def _session_is_fresh(tokens: Optional[SessionTokens]) -> bool:
@@ -293,7 +295,8 @@ async def _refresh_inside_guard(guard, vault, resolved) -> tuple[bool, bool]:
         return True, False
 
     provider_id = tokens.provider_id or getattr(resolved, "provider_id", None)
-    client = _client_for_refresh(provider_id)
+    generation_id = getattr(resolved, "credential_generation_id", None)
+    client = _client_for_refresh(provider_id, generation_id)
     fetch_fn = getattr(client, "fetch_access_token", None) if client is not None else None
     if fetch_fn is None:
         logger.warning("No OIDC client able to refresh a session for provider '%s'", provider_id or DEFAULT_PROVIDER_ID)
@@ -595,6 +598,18 @@ async def _begin_login(request: Request, provider_id: str):
                 detail="OIDC authentication not available - configuration error",
             )
 
+        # The active credential generation is what this login — and only this login — is bound
+        # to. Bootstraps the row from current config on first use, so a deployment that never
+        # rotated behaves exactly as before; afterwards the shared row, not this process, is the
+        # authority on which credentials are current.
+        generation = credential_generations.get_active_generation(provider_id)
+        if generation is None:
+            logger.error("No active credential generation for provider '%s'", provider_id)
+            raise HTTPException(
+                status_code=500,
+                detail="OIDC authentication not available - configuration error",
+            )
+
         # Capture an optional ?next= return target so the callback can return the user to where
         # they were before the session expired. Validated to be a same-origin relative path;
         # anything else is dropped silently.
@@ -603,8 +618,13 @@ async def _begin_login(request: Request, provider_id: str):
         # The CSRF state, and everything this attempt needs to remember, is a row rather than a
         # cookie key (#316). One key held one attempt, so a second tab overwrote the first and
         # whichever came back second failed a check it should have passed — and nothing recorded
-        # *which* provider had been asked, which is the question RFC 9207 exists to answer.
-        oauth_state = store.create_auth_state(provider_id, redirect_after_login=next_target)
+        # *which* provider had been asked, which is the question RFC 9207 exists to answer. The
+        # credential generation id pins the callback to the client this redirect uses.
+        oauth_state = store.create_auth_state(
+            provider_id,
+            redirect_after_login=next_target,
+            credential_generation_id=generation.generation_id,
+        )
 
         # Get redirect URI (configured or dynamic). Use a safe fallback if dynamic calculation fails
         try:
@@ -625,11 +645,12 @@ async def _begin_login(request: Request, provider_id: str):
 
         logger.debug(f"OIDC redirect URL: {redirect_url}")
 
-        # ``default`` resolves to the legacy ``oauth.oidc`` client, so a deployment that never
-        # adopted the registry keeps the client it already had.
-        client = get_client(provider_id) or (oauth.oidc if provider_id == DEFAULT_PROVIDER_ID else None)
+        # The client of the active generation this state row named. The callback resolves the
+        # same generation by id, so a rotation between the redirect and the return cannot make
+        # the exchange use a different secret.
+        client = credential_generations.generation_client(provider_id, generation.generation_id)
         if client is None:
-            logger.error("No registered OAuth client for provider '%s'", provider_id)
+            logger.error("No registered OAuth client for provider '%s' generation '%s'", provider_id, generation.generation_id)
             raise HTTPException(status_code=500, detail="OIDC authentication not available")
 
         # Redirect to OIDC provider
@@ -697,7 +718,12 @@ def _retire_previous_login(session) -> None:
             logger.warning("Could not revoke the previous session on re-login: %s", exc)
 
 
-def _open_server_session(username: str, provider_id: Optional[str] = None, tokens: Optional[SessionTokens] = None) -> str:
+def _open_server_session(
+    username: str,
+    provider_id: Optional[str] = None,
+    tokens: Optional[SessionTokens] = None,
+    credential_generation_id: Optional[str] = None,
+) -> str:
     """Open a server-side session for ``username`` and return its opaque id.
 
     The row's lifetime mirrors the cookie's, so a session cannot outlive the credential that
@@ -712,6 +738,8 @@ def _open_server_session(username: str, provider_id: Optional[str] = None, token
         username: The user logging in.
         provider_id: Registry id of the provider that authenticated them.
         tokens: The provider tokens to keep with the session.
+        credential_generation_id: Id of the credential generation the login authenticated with,
+            so the session's later refresh/revocation use those credentials while retained.
 
     Returns:
         The session id.
@@ -721,7 +749,13 @@ def _open_server_session(username: str, provider_id: Optional[str] = None, token
     if provider_id is None and tokens is not None:
         provider_id = tokens.provider_id
     encrypted = get_token_vault().encrypt(tokens) if tokens is not None else None
-    return store.create_auth_session(username, expires_at=expires_at, provider_id=provider_id, encrypted_tokens=encrypted)
+    return store.create_auth_session(
+        username,
+        expires_at=expires_at,
+        provider_id=provider_id,
+        encrypted_tokens=encrypted,
+        credential_generation_id=credential_generation_id,
+    )
 
 
 # How long logout waits on the IdP — for its discovery document, or for a token revocation —
@@ -734,40 +768,43 @@ class _RevocationRefused(Exception):
     """The IdP answered the RFC 7009 revocation request with an error status."""
 
 
-def _logout_context(request: Request, session_id: Optional[str]) -> tuple[str, Optional[SessionTokens]]:
-    """The provider that opened ``session_id`` and the tokens it issued, read before revocation.
+def _logout_context(request: Request, session_id: Optional[str]) -> tuple[str, Optional[SessionTokens], Optional[str]]:
+    """The provider, tokens and credential generation that opened ``session_id``.
 
     The provider is the one the session row records, else the one recorded with its tokens, else
     ``default`` — a session from before providers were recorded belongs to the legacy client.
-    Tokens recorded for a provider other than the one the row names are dropped: a credential is
-    only ever offered back to the issuer that minted it. Best effort — logout never fails over
-    this; anything unreadable yields ``("default", None)``, which is the pre-#367 behaviour.
+    The generation is the one the row recorded, so revocation and end-session redirect use the
+    credentials the grant was created with while that generation is retained. Tokens recorded for
+    a provider other than the one the row names are dropped: a credential is only ever offered
+    back to the issuer that minted it. Best effort — logout never fails over this; anything
+    unreadable yields ``("default", None, None)``, which is the pre-#367 behaviour.
 
     Parameters:
         request: The logout request (its ``state`` may already hold the resolved session).
         session_id: The session being logged out, if any.
 
     Returns:
-        ``(provider_id, tokens)``.
+        ``(provider_id, tokens, credential_generation_id)``.
     """
     if not session_id:
-        return DEFAULT_PROVIDER_ID, None
+        return DEFAULT_PROVIDER_ID, None, None
     try:
         resolved = getattr(getattr(request, "state", None), "resolved_session", None)
         if resolved is None or getattr(resolved, "session_id", session_id) != session_id:
             resolved = store.resolve_auth_session(session_id)
         if resolved is None:
-            return DEFAULT_PROVIDER_ID, None
+            return DEFAULT_PROVIDER_ID, None, None
         tokens = get_token_vault().decrypt(getattr(resolved, "encrypted_tokens", None))
+        generation_id = getattr(resolved, "credential_generation_id", None)
     except Exception as exc:
         logger.debug("Could not read the session's provider and tokens for logout: %s", type(exc).__name__)
-        return DEFAULT_PROVIDER_ID, None
+        return DEFAULT_PROVIDER_ID, None, None
     row_provider = getattr(resolved, "provider_id", None)
     token_provider = tokens.provider_id if tokens is not None else None
     provider_id = row_provider or token_provider or DEFAULT_PROVIDER_ID
     if tokens is not None and token_provider not in (None, provider_id):
         tokens = None
-    return provider_id, tokens
+    return provider_id, tokens, generation_id
 
 
 async def _provider_metadata(client) -> dict:
@@ -805,7 +842,12 @@ async def _revoke_at_revocation_endpoint(client, refresh_token: str) -> bool:
     return True
 
 
-async def _revoke_refresh_token_at_idp(provider_id: str, tokens: Optional[SessionTokens], username: Optional[str]) -> None:
+async def _revoke_refresh_token_at_idp(
+    provider_id: str,
+    tokens: Optional[SessionTokens],
+    username: Optional[str],
+    credential_generation_id: Optional[str] = None,
+) -> None:
     """Revoke the session's refresh token at the provider that issued it (RFC 7009). Best effort.
 
     Without this, the ``offline_access`` grant behind ``OIDC_USE_REFRESH_TOKEN`` outlives logout:
@@ -818,7 +860,7 @@ async def _revoke_refresh_token_at_idp(provider_id: str, tokens: Optional[Sessio
     """
     if tokens is None or not tokens.has_refresh_token:
         return
-    client = _client_for_refresh(provider_id)
+    client = _client_for_refresh(provider_id, credential_generation_id)
     if client is None or not hasattr(client, "_get_oauth_client"):
         # The provider is no longer configured (or is not OIDC): nothing here holds the client
         # credentials to revoke with, so the grant lives until the IdP expires it. Say so.
@@ -846,15 +888,29 @@ async def _revoke_refresh_token_at_idp(provider_id: str, tokens: Optional[Sessio
         logger.debug("Revoked the session's refresh token at provider '%s'", provider_id)
 
 
-async def _named_provider_end_session_url(request: Request, provider_id: str, tokens: Optional[SessionTokens]) -> Optional[str]:
+async def _named_provider_end_session_url(
+    request: Request,
+    provider_id: str,
+    tokens: Optional[SessionTokens],
+    credential_generation_id: Optional[str] = None,
+) -> Optional[str]:
     """RP-initiated logout at the named OIDC provider that opened the session, or None.
 
     Uses that provider's own ``end_session_endpoint`` and client id, and offers its own ID token
-    as ``id_token_hint``. None — local logout only — when the provider has no registered client
-    (not OIDC, or no longer configured) or advertises no end-session endpoint. Never falls back to
+    as ``id_token_hint``. The pinned generation's client is preferred while it exists, since the
+    IdP may key the end-session request to the client that authenticated the session. None —
+    local logout only — when no client can be resolved (not OIDC, or the generation and the
+    provider are both gone) or the client advertises no end-session endpoint. Never falls back to
     the default provider, which did not authenticate this session.
     """
-    client = get_client(provider_id)
+    if credential_generation_id:
+        # Maintenance follows the pinned generation only while it is retained, like refresh and
+        # revocation; afterwards the active client drives the end-session redirect.
+        client = credential_generations.usable_pinned_client(provider_id, credential_generation_id)
+    else:
+        client = None
+    if client is None:
+        client = get_client(provider_id)
     if client is None:
         logger.debug("No OIDC client for provider '%s'; ending the local session only", provider_id)
         return None
@@ -895,7 +951,7 @@ async def logout(request: Request):
         session_id = session.get("session_id")
         # Read before revocation: a revoked row no longer resolves. The provider that opened the
         # session decides where RP-initiated logout and token revocation go.
-        provider_id, session_tokens = _logout_context(request, session_id)
+        provider_id, session_tokens, session_generation_id = _logout_context(request, session_id)
         # Likewise the SAML NameID and SessionIndex for single logout (#329).
         from mlflow_oidc_auth.routers.saml import saml_logout_context, saml_logout_redirect
 
@@ -942,16 +998,18 @@ async def logout(request: Request):
 
         # End the IdP grant too, before the browser leaves: RP-initiated logout does not end the
         # offline session a refresh token belongs to. Never raises.
-        await _revoke_refresh_token_at_idp(provider_id, session_tokens, username)
+        await _revoke_refresh_token_at_idp(provider_id, session_tokens, username, session_generation_id)
 
         if provider_id != DEFAULT_PROVIDER_ID:
             # A named OIDC provider opened this session: log out there, or nowhere.
-            logout_url = await _named_provider_end_session_url(request, provider_id, session_tokens)
+            logout_url = await _named_provider_end_session_url(request, provider_id, session_tokens, session_generation_id)
             return RedirectResponse(url=logout_url or _build_ui_url(request, "/auth"), status_code=302)
 
-        # Check if OIDC provider supports logout
-        if hasattr(oauth.oidc, "server_metadata"):
-            metadata = getattr(oauth.oidc, "server_metadata", {})
+        # The default provider's end-session endpoint, via the client the session was pinned to
+        # while its generation is retained (the legacy ``oidc`` alias otherwise).
+        default_client = _client_for_refresh(DEFAULT_PROVIDER_ID, session_generation_id)
+        if default_client is not None and hasattr(default_client, "server_metadata"):
+            metadata = getattr(default_client, "server_metadata", {})
             end_session_endpoint = metadata.get("end_session_endpoint")
 
             if end_session_endpoint:
@@ -960,11 +1018,11 @@ async def logout(request: Request):
                 # such as Keycloak (>= 18) reject RP-initiated logout with "Missing
                 # parameters: id_token_hint" unless either id_token_hint or client_id is
                 # present. The session is already cleared, so client_id is the reliable
-                # choice here.
+                # choice here — read from the pinned client rather than live config.
                 post_logout_redirect = _build_ui_url(request, "/auth")
                 logout_params = {
                     "post_logout_redirect_uri": post_logout_redirect,
-                    "client_id": config.OIDC_CLIENT_ID,
+                    "client_id": getattr(default_client, "client_id", None) or config.OIDC_CLIENT_ID,
                 }
                 if session_tokens is not None and session_tokens.id_token:
                     # Held on the (now revoked) session row since #367, so it can be offered.
@@ -1063,14 +1121,21 @@ async def _complete_login(request: Request, provider_id: Optional[str]):
             # cookie belongs to anyone else by the time the new session id is written.
             # Tokens first, cookie second (#367): the row is created with this login's tokens
             # already on it, and only then does the cookie name it.
-            pending_tokens = getattr(getattr(request, "state", None), "pending_session_tokens", None)
+            request_state = getattr(request, "state", None)
+            pending_tokens = getattr(request_state, "pending_session_tokens", None)
             if not isinstance(pending_tokens, SessionTokens):
                 pending_tokens = None
+            pending_generation = getattr(request_state, "pending_credential_generation_id", None)
             try:
                 if pending_tokens is not None:
-                    session_id = _open_server_session(username, provider_id=pending_tokens.provider_id, tokens=pending_tokens)
+                    session_id = _open_server_session(
+                        username,
+                        provider_id=pending_tokens.provider_id,
+                        tokens=pending_tokens,
+                        credential_generation_id=pending_generation,
+                    )
                 else:
-                    session_id = _open_server_session(username)
+                    session_id = _open_server_session(username, credential_generation_id=pending_generation)
                 session["session_id"] = session_id
             except Exception as exc:
                 # The user is provisioned earlier in this callback, so this should not happen —
@@ -1739,6 +1804,23 @@ async def _process_oidc_callback_fastapi(request: Request, session, provider_id:
         errors.append("Authorization response came from an unexpected issuer")
         return None, errors
 
+    # The callback may exchange the code only with the credential generation the login started.
+    # A missing row (purged while the login was in flight), a status that is not active/retired,
+    # or a passed retention deadline ends the attempt here with a stable error and no token
+    # request: trying the now-active generation's secret would post the code with credentials it
+    # was never bound to, and a failed exchange must not be retried against any other key.
+    pinned_generation_id = attempt.credential_generation_id
+    generation = credential_generations.get_generation(provider.id, pinned_generation_id) if pinned_generation_id else None
+    if generation is None or not generation.usable_at() or generation.provider_id != provider.id:
+        logger.info(
+            "Login attempt for provider '%s' is bound to generation '%s', which is missing or past its retention window",
+            provider.id,
+            pinned_generation_id,
+        )
+        errors.append("Your sign-in session has expired, please sign in again")
+        errors.append(LOGIN_GENERATION_EXPIRED_ERROR)
+        return None, errors
+
     session["redirect_after_login"] = attempt.redirect_after_login or session.get("redirect_after_login")
 
     # A new login supersedes whatever this browser was carrying, and must not inherit any of it:
@@ -1757,19 +1839,23 @@ async def _process_oidc_callback_fastapi(request: Request, session, provider_id:
         return None, errors
 
     try:
-        # Exchange authorization code for tokens
-        try:
-            exchange_client = _client_for_exchange(provider.id)
-        except RuntimeError as client_error:
-            logger.error("%s", client_error)
+        # Materialise the pinned generation's client in this process. It is the only client the
+        # code is ever offered to; when it cannot be built (its ciphertext is no longer
+        # decryptable, for example) the attempt fails closed rather than borrowing the active
+        # generation's client. The row just loaded is passed in so the bound check and the
+        # materialisation cost one row read rather than two.
+        exchange_client = credential_generations.generation_client(provider.id, pinned_generation_id, generation=generation)
+
+        if exchange_client is None or not hasattr(exchange_client, "authorize_access_token"):
+            logger.error(
+                "Pinned credential generation '%s' for provider '%s' has no usable OAuth client",
+                pinned_generation_id,
+                provider.id,
+            )
             errors.append("OIDC configuration error: OAuth client not properly initialized.")
             return None, errors
 
-        if not hasattr(exchange_client, "authorize_access_token"):
-            errors.append("OIDC configuration error: OAuth client not properly initialized.")
-            return None, errors
-
-        token_response = await _authorize_access_token_with_key_refresh(request, provider.id)
+        token_response = await _authorize_access_token_with_key_refresh(request, exchange_client)
 
         if not token_response:
             errors.append("Failed to exchange authorization code")
@@ -1851,11 +1937,13 @@ async def _process_oidc_callback_fastapi(request: Request, session, provider_id:
             return None, errors
 
         # The tokens go onto the session row when ``_complete_login`` opens it — never into the
-        # cookie (#367). Held on the request until then.
+        # cookie (#367). Held on the request until then, alongside the generation this login
+        # used so the session row is pinned to it as well.
         _drop_legacy_token_keys(session)
         request_state = getattr(request, "state", None)
         if request_state is not None:
             request_state.pending_session_tokens = _session_tokens_from_response(token_response, provider_id=provider.id)
+            request_state.pending_credential_generation_id = pinned_generation_id
 
         return username, []
 

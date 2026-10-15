@@ -106,6 +106,8 @@ class TestLoginEndpoint:
             # The attempt is a row now, not a cookie key: what login must do is start one and
             # send its state to the provider (#316).
             assert created_states, "login must record an attempt"
+            # The attempt pins the callback to the active credential generation.
+            assert created_states[-1]["credential_generation_id"] == "gen-1"
 
             # Verify OAuth redirect was called
             mock_oauth.oidc.authorize_redirect.assert_called_once_with(
@@ -1470,11 +1472,14 @@ class TestLogoutAtNamedOidcProvider:
 
     @pytest.mark.asyncio
     async def test_default_session_keeps_the_legacy_end_session_request(self, mock_request_with_session, mock_oauth, monkeypatch):
-        """Unchanged for default/legacy sessions: default endpoint, OIDC_CLIENT_ID, its own hint."""
+        """Default/legacy sessions: default endpoint, the client's own id, its own hint."""
         from mlflow_oidc_auth.routers import auth as auth_module
         from mlflow_oidc_auth.session.token_vault import SessionTokens
 
-        monkeypatch.setattr(auth_module.config, "OIDC_CLIENT_ID", "legacy-client")
+        # The client id is now read from the (possibly generation-pinned) client, not from live
+        # config: a rotated generation's logout uses that generation's client id.
+        mock_oauth.oidc.client_id = "legacy-client"
+        monkeypatch.setattr(auth_module.config, "OIDC_CLIENT_ID", "config-level-client")
         fake_store = _LogoutStore(SessionTokens(provider_id=None, id_token="idt-legacy"), provider_id=None)
 
         _, result = await _do_logout(mock_request_with_session, fake_store, default_client=mock_oauth.oidc)
@@ -1565,12 +1570,14 @@ class TestSanitizeNext:
 
 @pytest.fixture(autouse=True)
 def in_flight_login_attempt(monkeypatch):
-    """Answer the callback's state lookup with a live attempt (#316).
+    """Answer the callback's state lookup with a live attempt (#316) pinned to a generation.
 
     The CSRF state moved out of the cookie and into an ``auth_state`` row, so a callback test
     that seeds ``session["oauth_state"]`` no longer describes anything. This stands in for the
-    row: any non-empty ``state`` resolves to an attempt at the ``default`` provider, which is
-    what these cases were always about — the user-management half of the callback.
+    row: any non-empty ``state`` resolves to an attempt at the ``default`` provider pinned to
+    ``gen-1``, which is what these cases were always about — the user-management half of the
+    callback. The generation seams resolve in memory (no real store) and materialise whatever
+    client the test installs as ``oauth.oidc`` at call time.
 
     The state machinery itself is tested directly in ``test_auth_state.py`` and
     ``test_provider_login.py``.
@@ -1582,7 +1589,7 @@ def in_flight_login_attempt(monkeypatch):
     monkeypatch.setattr(
         auth_router_mod.store,
         "consume_auth_state",
-        lambda state: AuthAttempt(state=state, provider_id="default") if state else None,
+        lambda state: AuthAttempt(state=state, provider_id="default", credential_generation_id="gen-1") if state else None,
         raising=False,
     )
     monkeypatch.setattr(
@@ -1591,6 +1598,21 @@ def in_flight_login_attempt(monkeypatch):
         RegistryLoadResult(providers=[ProviderConfig(id="default", type="oidc", audience="mlflow")], errors=[], source="legacy"),
         raising=False,
     )
+    active = SimpleNamespace(generation_id="gen-1")
+    monkeypatch.setattr(auth_router_mod.credential_generations, "get_active_generation", lambda provider_id: active)
+    monkeypatch.setattr(
+        auth_router_mod.credential_generations,
+        "get_generation",
+        lambda provider_id, generation_id: SimpleNamespace(provider_id=provider_id, generation_id=generation_id, usable_at=lambda moment=None: True),
+    )
+
+    def _generation_client(provider_id, generation_id, generation=None):
+        # Resolved lazily so a test's own ``oauth`` mock (typically ``oauth.oidc``) is the client
+        # the callback exchanges with, exactly as these tests were written.
+        return getattr(auth_router_mod.oauth, "oidc", None)
+
+    monkeypatch.setattr(auth_router_mod.credential_generations, "generation_client", _generation_client)
+    monkeypatch.setattr(auth_router_mod.credential_generations, "usable_pinned_client", _generation_client)
 
     # Identity resolution and provisioning policy (#318) run inside the callback now, so the
     # store has to answer two questions: is this username taken, and is this identity bound.

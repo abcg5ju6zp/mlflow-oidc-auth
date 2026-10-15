@@ -220,8 +220,14 @@ class TestTheErrorReachesTheUser:
 
         monkeypatch.setattr(auth_router_mod, "is_oidc_configured", lambda provider_id=None: True)
         monkeypatch.setattr(auth_router_mod, "assert_pkce_supported", _unsupported)
-        # A registered client has to exist, or login fails earlier for an unrelated reason.
-        monkeypatch.setattr(auth_router_mod.oauth, "oidc", SimpleNamespace(authorize_redirect=_never_called), raising=False)
+        # The active generation and its client stand in for the registered OAuth client.
+        monkeypatch.setattr(
+            auth_router_mod.credential_generations,
+            "get_active_generation",
+            lambda provider_id: SimpleNamespace(generation_id="gen-1"),
+        )
+        pinned_client = SimpleNamespace(authorize_redirect=_never_called)
+        monkeypatch.setattr(auth_router_mod.credential_generations, "generation_client", lambda provider_id, generation_id: pinned_client)
 
         class DummyRequest:
             def __init__(self):
@@ -253,25 +259,38 @@ class TestTheErrorReachesTheUser:
 
         monkeypatch.setattr(auth_router_mod.config, "OIDC_CODE_CHALLENGE", "S256")
 
-        async def _boom(request):
+        async def _boom(request, client=None):
             raise RuntimeError("invalid_grant: PKCE verification failed")
 
-        async def _no_refresh():
+        async def _no_refresh(client=None):
             return None
 
         from mlflow_oidc_auth.provider_registry import ProviderConfig, RegistryLoadResult
         from mlflow_oidc_auth.repository.auth_state import AuthAttempt
 
         monkeypatch.setattr(auth_router_mod, "_call_authorize_access_token", _boom)
-        monkeypatch.setattr(auth_router_mod.store, "consume_auth_state", lambda state: AuthAttempt(state=state, provider_id="default"), raising=False)
+        monkeypatch.setattr(
+            auth_router_mod.store,
+            "consume_auth_state",
+            lambda state: AuthAttempt(state=state, provider_id="default", credential_generation_id="gen-1"),
+            raising=False,
+        )
         monkeypatch.setattr(
             auth_router_mod.config,
             "AUTH_PROVIDERS",
             RegistryLoadResult(providers=[ProviderConfig(id="default", type="oidc", audience="mlflow")], errors=[], source="legacy"),
             raising=False,
         )
+        # The attempt's pinned generation exists and materialises the fake exchange client.
+        monkeypatch.setattr(
+            auth_router_mod.credential_generations,
+            "get_generation",
+            lambda provider_id, generation_id: SimpleNamespace(provider_id=provider_id, generation_id=generation_id, usable_at=lambda moment=None: True),
+        )
+        pinned_client = SimpleNamespace(authorize_access_token=_boom)
+        monkeypatch.setattr(auth_router_mod.credential_generations, "generation_client", lambda provider_id, generation_id: pinned_client)
         monkeypatch.setattr(auth_router_mod, "_refresh_oidc_jwks", _no_refresh)
-        monkeypatch.setattr(auth_router_mod.oauth, "oidc", SimpleNamespace(authorize_access_token=_boom), raising=False)
+        monkeypatch.setattr(auth_router_mod.oauth, "oidc", pinned_client, raising=False)
 
         class DummyRequest:
             def __init__(self):

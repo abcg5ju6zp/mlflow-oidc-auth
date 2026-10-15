@@ -111,6 +111,19 @@ def login(monkeypatch):
 
     clients: dict = {}
 
+    # The callback is bound to a generation; the installed provider client is what that
+    # generation materialises to.
+    monkeypatch.setattr(
+        auth_router_mod.credential_generations,
+        "get_generation",
+        lambda pid, gid: SimpleNamespace(provider_id=pid, generation_id=gid, usable_at=lambda moment=None: True),
+    )
+    def _generation_client(pid, gid, generation=None):
+        return clients[pid][0] if pid in clients else None
+
+    monkeypatch.setattr(auth_router_mod.credential_generations, "generation_client", _generation_client)
+    monkeypatch.setattr(auth_router_mod.credential_generations, "usable_pinned_client", _generation_client)
+
     def _install(client, provider_id="default", issuer=ISSUER, userinfo_groups=False):
         clients[provider_id] = (client, issuer, userinfo_groups)
         registry = RegistryLoadResult(
@@ -126,7 +139,7 @@ def login(monkeypatch):
         monkeypatch.setattr(
             auth_router_mod.store,
             "consume_auth_state",
-            lambda state: AuthAttempt(state=state, provider_id=provider_id),
+            lambda state: AuthAttempt(state=state, provider_id=provider_id, credential_generation_id="gen-1"),
             raising=False,
         )
         request = DummyRequest(state="state-1", code="c")

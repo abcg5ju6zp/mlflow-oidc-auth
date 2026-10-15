@@ -24,6 +24,12 @@ from mlflow_oidc_auth.repository.user import UserRepository
 from mlflow_oidc_auth.repository.user_token import UserTokenRepository
 from mlflow_oidc_auth.repository.auth_session import AuthSessionRepository
 from mlflow_oidc_auth.repository.auth_state import AuthStateRepository
+from mlflow_oidc_auth.repository.credential_generation import (
+    ActiveGenerationConflict,
+    CredentialGeneration,
+    CredentialGenerationRepository,
+    RotationOutcome,
+)
 from mlflow_oidc_auth.repository.user_identity import UserIdentityRepository
 from mlflow_oidc_auth.repository.experiment_permission_regex import (
     ExperimentPermissionRegexRepository,
@@ -122,6 +128,10 @@ __all__ = [
     "UserIdentityRepository",
     "AuthSessionRepository",
     "AuthStateRepository",
+    "CredentialGenerationRepository",
+    "CredentialGeneration",
+    "RotationOutcome",
+    "ActiveGenerationConflict",
     "ExperimentPermissionRegexRepository",
     "ExperimentPermissionGroupRegexRepository",
     "RegisteredModelPermissionRegexRepository",

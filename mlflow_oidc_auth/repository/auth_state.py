@@ -48,16 +48,20 @@ class AuthAttempt:
             the registry is the authority on a provider's issuer, and a provider repointed at a
             different one mid-flight *should* fail the comparison rather than pass it against a
             stale copy.
-        redirect_after_login: Where to send the browser once it is authenticated.
+        redirect_after_login: Where to send the browser once the authentication completes.
         binding_hash: SHA-256 (hex) of the nonce the SAML login start put in a browser cookie, or
             None when the attempt is not browser-bound (every OIDC attempt; SAML with the binding
             off). See ``routers.saml`` (#374).
+        credential_generation_id: Opaque id of the credential generation the login was started
+            with; the callback may exchange the code only against that same generation's client.
+            None for SAML attempts and for OIDC attempts started by an older release.
     """
 
     state: str
     provider_id: str
     redirect_after_login: Optional[str] = None
     binding_hash: Optional[str] = None
+    credential_generation_id: Optional[str] = None
 
 
 def _now() -> datetime:
@@ -78,6 +82,7 @@ class AuthStateRepository:
         redirect_after_login: Optional[str] = None,
         lifetime_seconds: int = DEFAULT_STATE_LIFETIME_SECONDS,
         binding_hash: Optional[str] = None,
+        credential_generation_id: Optional[str] = None,
     ) -> str:
         """Start an attempt and return its ``state``.
 
@@ -87,6 +92,8 @@ class AuthStateRepository:
             lifetime_seconds: How long the attempt may take.
             binding_hash: Hash of the browser-binding nonce, for a SAML attempt bound to the
                 browser that started it. Never the nonce itself.
+            credential_generation_id: Id of the credential generation this OIDC login starts
+                with; the callback is bound to it. None for SAML attempts.
 
         Returns:
             The state value to send to the authorization endpoint.
@@ -99,6 +106,7 @@ class AuthStateRepository:
                     provider_id=provider_id,
                     relay_state=redirect_after_login,
                     binding_hash=binding_hash,
+                    credential_generation_id=credential_generation_id,
                     expires_at=_now() + timedelta(seconds=lifetime_seconds),
                 )
             )
@@ -127,6 +135,7 @@ class AuthStateRepository:
                 provider_id=row.provider_id or "",
                 redirect_after_login=row.relay_state,
                 binding_hash=row.binding_hash,
+                credential_generation_id=row.credential_generation_id,
             )
             expired = row.expires_at is not None and row.expires_at <= _now()
 

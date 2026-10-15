@@ -57,6 +57,8 @@ class ResolvedSession:
         provider_id: Registry id of the provider that authenticated the session, when recorded.
         encrypted_tokens: The session's provider tokens, encrypted (see ``session.token_vault``).
             Kept out of ``repr`` so it cannot reach a log line by accident.
+        credential_generation_id: Id of the credential generation the login authenticated under,
+            so the session's refresh and revocation use those credentials while retained.
     """
 
     username: str
@@ -67,6 +69,7 @@ class ResolvedSession:
     session_id: Optional[str] = None
     provider_id: Optional[str] = None
     encrypted_tokens: Optional[str] = field(default=None, repr=False)
+    credential_generation_id: Optional[str] = None
     #: Whether the session's user is a service account: such a session is never honoured.
     is_service_account: bool = False
 
@@ -190,7 +193,14 @@ class AuthSessionRepository:
         self._Session: Callable[[], Session] = session_maker
         self._row_locks = row_locks
 
-    def create(self, username: str, expires_at: datetime, provider_id: Optional[str] = None, encrypted_tokens: Optional[str] = None) -> str:
+    def create(
+        self,
+        username: str,
+        expires_at: datetime,
+        provider_id: Optional[str] = None,
+        encrypted_tokens: Optional[str] = None,
+        credential_generation_id: Optional[str] = None,
+    ) -> str:
         """Open a session for ``username`` and return its opaque identifier.
 
         The identifier is generated here rather than derived from anything about the user: it is
@@ -202,14 +212,16 @@ class AuthSessionRepository:
             provider_id: Registry id of the provider that authenticated them, when known.
             encrypted_tokens: The provider tokens, already encrypted, so they are on the row
                 before the cookie ever names it.
+            credential_generation_id: Id of the credential generation the login used, so later
+                refreshes and revocations present the credentials the grant was created with.
 
         Returns:
             The session id to place in the cookie.
 
         Raises:
             MlflowException: If the user does not exist. Raised with a proper error code rather
-                than a bare ``ValueError``, which the managed session would rewrite into an
-                opaque ``INTERNAL_ERROR``.
+            than a bare ``ValueError``, which the managed session would rewrite into an
+            opaque ``INTERNAL_ERROR``.
         """
         username = normalize_username(username)
         session_id = secrets.token_urlsafe(SESSION_ID_BYTES)
@@ -224,6 +236,7 @@ class AuthSessionRepository:
                     provider_id=provider_id,
                     expires_at=expires_at.replace(tzinfo=None) if expires_at.tzinfo else expires_at,
                     encrypted_tokens=encrypted_tokens,
+                    credential_generation_id=credential_generation_id,
                 )
             )
             session.flush()
@@ -257,6 +270,7 @@ class AuthSessionRepository:
                     SqlAuthSession.session_id,
                     SqlAuthSession.provider_id,
                     SqlAuthSession.encrypted_tokens,
+                    SqlAuthSession.credential_generation_id,
                 )
                 .join(SqlAuthSession, SqlAuthSession.user_id == SqlUser.id)
                 .filter(
@@ -278,6 +292,7 @@ class AuthSessionRepository:
                 provider_id=row[7],
                 encrypted_tokens=row[8],
                 is_service_account=bool(row[4]),
+                credential_generation_id=row[9],
             )
 
     def store_tokens(self, session_id: str, encrypted_tokens: Optional[str]) -> bool:

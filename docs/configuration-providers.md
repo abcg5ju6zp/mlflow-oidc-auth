@@ -145,6 +145,98 @@ Secret providers (AWS Secrets Manager, Azure Key Vault, etc.) only handle SECRET
 
 ---
 
+## Credential Generations and Secret Rotation
+
+Rotating an OIDC client secret must not break a login that is already in flight or the
+sessions already issued. The plugin therefore versions each provider's credentials as
+**generations** stored in the plugin database (`oidc_credential_generations`).
+
+### What a generation pins
+
+Every generation records exactly what an OIDC client is registered with:
+
+- the client id;
+- the client secret, **encrypted at rest** with a key derived separately from the session-cookie
+  encryption key (`OIDC_CREDENTIAL_ENCRYPTION_KEY`, falling back to a key derived from
+  `SECRET_KEY`);
+- the discovery URL;
+- the client/callback settings in force (scope, TLS verification, PKCE method, the static
+  redirect URI);
+- the effective time and a fingerprint over all of the above.
+
+A login records the **active** generation id on its state row, and its session row records the
+same id. Its callback exchanges the authorization code only against that generation's client —
+once. If the secret is rotated between the redirect to the IdP and the callback, the callback
+still uses the old (now retired) generation's credentials; the code is never re-tried against a
+different secret. Session refresh tokens and RFC 7009 revocations also use the generation a
+session opened while it exists.
+
+### Retiring and pruning
+
+When a rotation publishes a new active generation, the previous one becomes **retired** with a
+retention deadline (`effective_time + OIDC_CREDENTIAL_GENERATION_RETENTION_SECONDS`). It stays
+usable for the in-flight logins (15-minute state lifetime) and the sessions that still reference
+it. A retired generation is physically deleted (its ciphertext with it) when **both** are true:
+
+- its retention deadline has passed, **or**
+- it is older than the in-flight login lifetime and no in-flight state row and no live session
+  row reference it (so zero-retention rotations clean up immediately and safely).
+
+After the deadline, a callback bound to a purged generation is not exchanged at all; the user is
+redirected back with the stable error `login_expired` and signs in again.
+
+### Triggering a refresh
+
+The configuration providers are re-read on demand through the admin-only endpoint (there is no
+CLI command):
+
+```
+POST /api/2.0/mlflow/oidc/credentials/providers/{provider_id}/refresh
+```
+
+(and the `/ajax-api/...` twin for the UI). The response is one of:
+
+- `unchanged` — the resolved material has the same fingerprint; nothing was published;
+- `rotated` — a new generation was committed atomically (active switch, retirement of the
+  previous generation, and pruning of dead generations in one transaction);
+- a failure (`422` validation, `409` a concurrent refresh committed other credentials,
+  `500` the switch/cleanup could not be committed, `503` configuration unreadable,
+  `404` unknown provider). A failure never changes the active generation.
+
+New credentials are validated **before** publication:
+
+1. the new discovery document must load and advertise a token endpoint;
+2. for a confidential client, a `client_credentials` probe is sent to that endpoint. An HTTP
+   `invalid_client` (or a network/timeout error) rejects the rotation; `invalid_grant`,
+   `unauthorized_client` or `unsupported_grant_type` passes — those prove the secret
+   authenticated and merely say the client is not allowed that grant. A public client (PKCE)
+   skips the probe.
+
+The endpoint is idempotent and multi-worker safe: concurrent refreshes with the same material
+adopt the single committed generation; every worker rebuilds identical clients from the shared
+rows after a restart, and the per-generation authlib client names are deterministic, so no two
+workers can construct conflicting clients. Rotating one provider never touches another
+provider's clients or its cached JWKS.
+
+Inspect the generations (metadata only — secrets are never returned):
+
+```
+GET /api/2.0/mlflow/oidc/credentials/providers/{provider_id}/generations
+```
+
+A deployment that never calls the endpoint behaves exactly as before: a first generation is
+bootstrapped from the current configuration at startup or first login without probing the IdP.
+
+### Related settings
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `OIDC_CREDENTIAL_GENERATION_RETENTION_SECONDS` | How long a retired generation stays usable | `SESSION_COOKIE_MAX_AGE_SECONDS` (or 14 days) + 900 |
+| `OIDC_CREDENTIAL_VALIDATION_SECONDS` | Timeout for the discovery fetch and the validation probe | `10` |
+| `OIDC_CREDENTIAL_ENCRYPTION_KEY` | Dedicated Fernet key (or comma-separated keys) for generation secrets; the first key encrypts, all of them may decrypt | derived from `SECRET_KEY` |
+
+---
+
 ## AWS Deployment
 
 ### AWS Secrets Manager
@@ -452,6 +544,14 @@ Example: `CONFIG_PROVIDERS=aws-secrets-manager,env` uses only those two provider
 |----------|-------------|---------|
 | `CONFIG_K8S_SECRETS_ENABLED` | Enable this provider | `false` |
 | `CONFIG_K8S_SECRETS_PATH` | Mount path for secrets | `/var/run/secrets/mlflow-oidc-auth` |
+
+### Credential Generations
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `OIDC_CREDENTIAL_ENCRYPTION_KEY` | Fernet key(s) for encrypted client-secret storage | derived from `SECRET_KEY` |
+| `OIDC_CREDENTIAL_GENERATION_RETENTION_SECONDS` | Seconds a retired generation remains usable | session lifetime (14 days) + 900 |
+| `OIDC_CREDENTIAL_VALIDATION_SECONDS` | Timeout for discovery fetch and validation probe | `10` |
 
 ---
 

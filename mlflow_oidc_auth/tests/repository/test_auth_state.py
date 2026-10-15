@@ -34,6 +34,14 @@ class TestAnAttemptRoundTrips:
         assert store.consume_auth_state(bound).binding_hash == "ab" * 32
         assert store.consume_auth_state(unbound).binding_hash is None
 
+    def test_the_credential_generation_comes_back_and_defaults_to_none(self, store):
+        """An OIDC attempt pins the callback to its generation; a SAML/legacy attempt carries none."""
+        pinned = store.create_auth_state("entra", credential_generation_id="gen-42")
+        unpinned = store.create_auth_state("saml")
+
+        assert store.consume_auth_state(pinned).credential_generation_id == "gen-42"
+        assert store.consume_auth_state(unpinned).credential_generation_id is None
+
     def test_the_state_is_unguessable(self, store):
         """It is the only thing tying a callback to the attempt that started it."""
         first = store.create_auth_state("entra")

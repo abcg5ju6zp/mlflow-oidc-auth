@@ -229,6 +229,22 @@ class TestQueryBudget:
         assert resolved.encrypted_tokens == BLOB
         assert resolved.provider_id == "default"
 
+    def test_the_credential_generation_rides_the_same_row(self, store):
+        sid = store.create_auth_session(
+            "alice@example.com",
+            expires_at=_in(3600),
+            provider_id="default",
+            encrypted_tokens=BLOB,
+            credential_generation_id="gen-7",
+        )
+
+        resolved = store.resolve_auth_session(sid)
+        assert resolved.credential_generation_id == "gen-7"
+
+    def test_a_session_without_a_generation_resolves_with_none(self, store):
+        sid = store.create_auth_session("alice@example.com", expires_at=_in(3600))
+        assert store.resolve_auth_session(sid).credential_generation_id is None
+
 
 class TestTokens:
     """The session row holds the encrypted provider tokens (#367)."""

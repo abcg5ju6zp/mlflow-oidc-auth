@@ -56,6 +56,11 @@ class SqlAuthSession(Base):
     session_id: Mapped[str] = mapped_column(String(255), nullable=False)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
     provider_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    # Opaque id of the credential generation this session logged in under, so its refresh-token
+    # exchanges and revocations keep using the credentials the grant was created with while that
+    # generation is retained. No foreign key on purpose: the generation is purged independently
+    # once the retention window passes (see db/models/credential.py).
+    credential_generation_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False, server_default=func.now())
     last_seen_at: Mapped[Optional[datetime]] = mapped_column(DateTime(), nullable=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime(), nullable=False)
@@ -65,6 +70,7 @@ class SqlAuthSession(Base):
         Index("ix_auth_sessions_session_id", "session_id", unique=True),
         Index("ix_auth_sessions_user_id", "user_id"),
         Index("ix_auth_sessions_expires_at", "expires_at"),
+        Index("ix_auth_sessions_credential_generation_id", "credential_generation_id"),
     )
 
 
@@ -82,6 +88,11 @@ class SqlAuthState(Base):
     nonce: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     code_verifier: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     provider_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    # Opaque id of the active credential generation the login was started with; the callback
+    # may exchange the code only against that same generation's client. No foreign key: a
+    # generation purged while the login is in flight leaves the callback a stable failure rather
+    # than a dangling constraint (see db/models/credential.py).
+    credential_generation_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     relay_state: Mapped[Optional[str]] = mapped_column(Text(), nullable=True)
     # SHA-256 (hex) of the browser-binding nonce a SAML login set in a cookie (#374). Null for
     # OIDC attempts and for SAML attempts started while the binding is off.
@@ -91,4 +102,5 @@ class SqlAuthState(Base):
     __table_args__ = (
         Index("ix_auth_state_state", "state", unique=True),
         Index("ix_auth_state_expires_at", "expires_at"),
+        Index("ix_auth_state_credential_generation_id", "credential_generation_id"),
     )

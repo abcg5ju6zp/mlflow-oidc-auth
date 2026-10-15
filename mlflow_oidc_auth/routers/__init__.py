@@ -38,6 +38,8 @@ from mlflow_oidc_auth.routers.mcp_server_permissions import (
     mcp_server_permissions_router,
     user_mcp_server_permissions_router,
 )
+from mlflow_oidc_auth.routers.oidc_credentials import OIDC_CREDENTIALS_ROUTER_PREFIX, oidc_credentials_router
+from mlflow_oidc_auth.routers.saml import saml_router
 from mlflow_oidc_auth.routers.trash import trash_router
 from mlflow_oidc_auth.routers.ui import ui_router
 from mlflow_oidc_auth.routers.user_permissions import user_permissions_router
@@ -68,6 +70,8 @@ __all__ = [
     "mcp_server_permissions_router",
     "user_mcp_server_permissions_router",
     "group_mcp_server_permissions_router",
+    "oidc_credentials_router",
+    "OIDC_CREDENTIALS_ROUTER_PREFIX",
     "trash_router",
     "ui_router",
     "user_permissions_router",
@@ -213,4 +217,5 @@ def get_all_routers() -> List[APIRouter]:
         webhook_router,
         # Always registered: it answers 404 itself while MLFLOW_ENABLE_WORKSPACES is off (#418).
         workspace_rules_router,
+        oidc_credentials_router,
     ]

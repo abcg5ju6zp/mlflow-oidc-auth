@@ -66,11 +66,42 @@ def attempt_at(monkeypatch):
         monkeypatch.setattr(
             auth_router_mod.store,
             "consume_auth_state",
-            lambda s: AuthAttempt(state=s, provider_id=provider_id, redirect_after_login=redirect_after_login) if s == state else None,
+            lambda s: (
+                AuthAttempt(state=s, provider_id=provider_id, redirect_after_login=redirect_after_login, credential_generation_id="gen-1")
+                if s == state
+                else None
+            ),
             raising=False,
         )
 
     return _install
+
+
+@pytest.fixture(autouse=True)
+def pinned_generation(monkeypatch):
+    """Default seam: the attempt's ``gen-1`` resolves to a usable generation with a dummy client.
+
+    Tests that exercise refusal paths before the generation check never reach these seams; the
+    tests that proceed past it need the pinned generation to exist. Individual tests replace the
+    seams to assert specific behaviour (purged generation, the exact exchange client, ...).
+    """
+
+    def _get(provider_id, generation_id):
+        if generation_id != "gen-1":
+            return None
+        return SimpleNamespace(provider_id=provider_id, generation_id=generation_id, usable_at=lambda moment=None: True)
+
+    monkeypatch.setattr(auth_router_mod.credential_generations, "get_generation", _get)
+    monkeypatch.setattr(
+        auth_router_mod.credential_generations,
+        "generation_client",
+        lambda provider_id, generation_id, generation=None: SimpleNamespace(authorize_access_token=object()),
+    )
+    monkeypatch.setattr(
+        auth_router_mod.credential_generations,
+        "usable_pinned_client",
+        lambda provider_id, generation_id: SimpleNamespace(authorize_access_token=object()),
+    )
 
 
 @pytest.fixture
@@ -257,13 +288,23 @@ class TestLoginStartsAnAttempt:
 
         monkeypatch.setattr(auth_router_mod.store, "create_auth_state", create, raising=False)
         monkeypatch.setattr(auth_router_mod, "is_oidc_configured", lambda provider_id=None: True)
+        monkeypatch.setattr(
+            auth_router_mod.credential_generations,
+            "get_active_generation",
+            lambda provider_id: SimpleNamespace(generation_id="gen-active"),
+        )
+        monkeypatch.setattr(
+            auth_router_mod.credential_generations,
+            "generation_client",
+            lambda provider_id, generation_id: SimpleNamespace(authorize_redirect=_redirect),
+        )
         monkeypatch.setattr(auth_router_mod, "assert_pkce_supported", _noop)
-        monkeypatch.setattr(auth_router_mod, "get_client", lambda provider_id=None: SimpleNamespace(authorize_redirect=_redirect), raising=False)
         monkeypatch.setattr(auth_router_mod, "get_configured_or_dynamic_redirect_uri", lambda request, callback_path, configured_uri=None: "http://cb")
 
         await auth_router_mod._begin_login(DummyRequest(), "okta")
 
         assert recorded["provider_id"] == "okta"
+        assert recorded["credential_generation_id"] == "gen-active"
 
     @pytest.mark.asyncio
     async def test_each_provider_gets_its_own_callback_path(self, two_providers, monkeypatch):
@@ -273,8 +314,17 @@ class TestLoginStartsAnAttempt:
 
         monkeypatch.setattr(auth_router_mod.store, "create_auth_state", lambda provider_id, **kwargs: "state-1", raising=False)
         monkeypatch.setattr(auth_router_mod, "is_oidc_configured", lambda provider_id=None: True)
+        monkeypatch.setattr(
+            auth_router_mod.credential_generations,
+            "get_active_generation",
+            lambda provider_id: SimpleNamespace(generation_id="gen-active"),
+        )
+        monkeypatch.setattr(
+            auth_router_mod.credential_generations,
+            "generation_client",
+            lambda provider_id, generation_id: SimpleNamespace(authorize_redirect=_redirect),
+        )
         monkeypatch.setattr(auth_router_mod, "assert_pkce_supported", _noop)
-        monkeypatch.setattr(auth_router_mod, "get_client", lambda provider_id=None: SimpleNamespace(authorize_redirect=_redirect), raising=False)
         monkeypatch.setattr(
             auth_router_mod,
             "get_configured_or_dynamic_redirect_uri",
@@ -412,7 +462,7 @@ class TestAnExistingUserCanStillLogIn:
         monkeypatch.setattr(
             auth_router_mod.store,
             "consume_auth_state",
-            lambda state: AuthAttempt(state=state, provider_id="default"),
+            lambda state: AuthAttempt(state=state, provider_id="default", credential_generation_id="gen-1"),
             raising=False,
         )
 
@@ -444,14 +494,13 @@ class TestAnExistingUserCanStillLogIn:
         monkeypatch.setattr("mlflow_oidc_auth.user.populate_groups", lambda **kwargs: None)
         monkeypatch.setattr("mlflow_oidc_auth.user.update_user", lambda **kwargs: None)
 
-        async def _exchange(request, provider_id=None):
+        async def _exchange(request, client=None):
             return {
                 "access_token": "at",
                 "userinfo": {"sub": "auth0|6f3a", "email": "alice@corp.com", "name": "Alice", "groups": ["mlflow"]},
             }
 
         monkeypatch.setattr(auth_router_mod, "_authorize_access_token_with_key_refresh", _exchange)
-        monkeypatch.setattr(auth_router_mod, "get_client", lambda provider_id=None: SimpleNamespace(authorize_access_token=_exchange), raising=False)
         monkeypatch.setattr(auth_router_mod, "_iss_parameter_supported", _no_iss)
         return identities, created
 
@@ -530,8 +579,17 @@ class TestTheLegacyCallbackBelongsToTheDefaultProvider:
         paths = []
         monkeypatch.setattr(auth_router_mod, "is_oidc_configured", lambda provider_id=None: True)
         monkeypatch.setattr(auth_router_mod.store, "create_auth_state", lambda provider_id, **kwargs: "state-1", raising=False)
+        monkeypatch.setattr(
+            auth_router_mod.credential_generations,
+            "get_active_generation",
+            lambda provider_id: SimpleNamespace(generation_id="gen-active"),
+        )
+        monkeypatch.setattr(
+            auth_router_mod.credential_generations,
+            "generation_client",
+            lambda provider_id, generation_id: SimpleNamespace(authorize_redirect=_redirect),
+        )
         monkeypatch.setattr(auth_router_mod, "assert_pkce_supported", _noop)
-        monkeypatch.setattr(auth_router_mod, "get_client", lambda provider_id=None: SimpleNamespace(authorize_redirect=_redirect), raising=False)
         monkeypatch.setattr(
             auth_router_mod,
             "get_configured_or_dynamic_redirect_uri",
@@ -543,24 +601,50 @@ class TestTheLegacyCallbackBelongsToTheDefaultProvider:
         assert paths == ["/callback"]
 
 
-class TestTheExchangeNeverBorrowsAnotherProvidersClient:
-    """An authorization code minted by one issuer must never be posted to another's token
-    endpoint — that hands one IdP a credential belonging to a different one."""
+class TestSessionMaintenanceFollowsThePinnedGeneration:
+    """Refresh and revocation prefer the session's generation client; the callback's strict
+    pinning is tested separately (it never falls back)."""
 
-    @pytest.mark.asyncio
-    async def test_a_named_provider_with_no_client_fails(self, monkeypatch):
-        monkeypatch.setattr(auth_router_mod, "get_client", lambda provider_id=None: None, raising=False)
+    def test_a_pinned_generation_is_used_for_refresh(self, monkeypatch):
+        pinned = SimpleNamespace(name="okta__gen__g9")
 
-        with pytest.raises(RuntimeError, match="partner"):
-            auth_router_mod._client_for_exchange("partner")
+        def _resolve(provider_id, generation_id):
+            assert (provider_id, generation_id) == ("okta", "g9")
+            return pinned
 
-    @pytest.mark.asyncio
-    async def test_the_default_provider_still_resolves_to_the_legacy_client(self, monkeypatch):
-        legacy = SimpleNamespace(authorize_access_token=_redirect)
+        monkeypatch.setattr(auth_router_mod.credential_generations, "usable_pinned_client", _resolve)
+        monkeypatch.setattr(auth_router_mod, "get_client", lambda provider_id=None: SimpleNamespace(name="active"), raising=False)
+
+        assert auth_router_mod._client_for_refresh("okta", "g9") is pinned
+
+    def test_a_purged_generation_falls_back_to_the_active_client(self, monkeypatch):
+        active = SimpleNamespace(name="okta-active")
+        monkeypatch.setattr(auth_router_mod.credential_generations, "usable_pinned_client", lambda p, g: None)
+        monkeypatch.setattr(auth_router_mod, "get_client", lambda provider_id=None: active, raising=False)
+
+        assert auth_router_mod._client_for_refresh("okta", "gone") is active
+
+    def test_default_provider_falls_back_to_the_legacy_alias(self, monkeypatch):
+        legacy = SimpleNamespace(name="oidc")
+        monkeypatch.setattr(auth_router_mod.credential_generations, "usable_pinned_client", lambda p, g: None)
         monkeypatch.setattr(auth_router_mod, "get_client", lambda provider_id=None: None, raising=False)
         monkeypatch.setattr(auth_router_mod.oauth, "oidc", legacy, raising=False)
 
-        assert auth_router_mod._client_for_exchange("default") is legacy
+        assert auth_router_mod._client_for_refresh("default", "gone") is legacy
+
+    def test_a_named_provider_without_a_pin_uses_the_active_client(self, monkeypatch):
+        active = SimpleNamespace(name="okta-active")
+        monkeypatch.setattr(auth_router_mod, "get_client", lambda provider_id=None: active, raising=False)
+
+        assert auth_router_mod._client_for_refresh("okta", None) is active
+
+    def test_a_pinned_generation_past_its_retention_falls_back_to_active(self, monkeypatch):
+        """Maintenance (refresh/revoke/end-session) stops using a generation past its deadline."""
+        active = SimpleNamespace(name="okta-active")
+        monkeypatch.setattr(auth_router_mod.credential_generations, "usable_pinned_client", lambda p, g: None)
+        monkeypatch.setattr(auth_router_mod, "get_client", lambda provider_id=None: active, raising=False)
+
+        assert auth_router_mod._client_for_refresh("okta", "expired") is active
 
 
 class TestTheLoginUrlsDoNotComeFromTheHostHeader:

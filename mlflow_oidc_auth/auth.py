@@ -21,7 +21,7 @@ from mlflow_oidc_auth.logger import get_logger
 # providers must pin an issuer and a key source, and this module uses it to decide which may
 # validate a token. Two copies could disagree, and the dangerous direction is silent — a type
 # routed here but never required there is a provider with no ``iss`` check.
-from mlflow_oidc_auth.provider_registry import ASYMMETRIC_ALGORITHMS, TOKEN_PROVIDER_TYPES
+from mlflow_oidc_auth.provider_registry import ASYMMETRIC_ALGORITHMS, DEFAULT_PROVIDER_ID, TOKEN_PROVIDER_TYPES
 
 logger = get_logger()
 
@@ -55,6 +55,24 @@ _JWKS_CACHE_KEY = "jwks"
 # different rotation schedules would thrash each other indefinitely.
 _provider_jwks_cache: TTLCache = TTLCache(maxsize=32, ttl=config.OIDC_JWKS_CACHE_TTL_SECONDS)
 _provider_jwks_lock = threading.Lock()
+
+
+def invalidate_provider_jwks_cache(provider_id: str) -> None:
+    """Evict the cached bearer-token JWKS of one provider after its credentials rotate.
+
+    Scoped to the provider: every cache key is a tuple whose first element is the provider id,
+    so other providers' entries are provably untouched. The deployment-wide flat cache belongs
+    to the legacy ``default`` provider and is cleared with it. The authlib per-client metadata
+    and JWKS caches are not here — a generation gets a fresh client instance with its own
+    caches by construction (``oauth.register_generation_client``).
+    """
+    with _provider_jwks_lock:
+        for key in list(_provider_jwks_cache.keys()):
+            if isinstance(key, tuple) and key[0] == provider_id:
+                _provider_jwks_cache.pop(key, None)
+    if provider_id == DEFAULT_PROVIDER_ID:
+        with _jwks_cache_lock:
+            _jwks_cache.clear()
 
 
 def _get_oidc_jwks(force_refresh: bool = False) -> dict:

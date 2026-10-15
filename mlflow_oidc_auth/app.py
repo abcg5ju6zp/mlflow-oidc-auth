@@ -28,7 +28,7 @@ from mlflow_oidc_auth.middleware import (
     add_fastapi_permission_middleware,
 )
 from mlflow_oidc_auth.middleware.route_path import static_prefix_conflicts
-from mlflow_oidc_auth.oauth import ensure_all_clients_registered
+
 from mlflow_oidc_auth.routers import ajax_alias_router, get_all_routers
 
 logger = get_logger()
@@ -70,11 +70,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """
     global _oidc_initialized, _oidc_provider_status
 
-    # Startup: Register OIDC client
+    # Startup: reconcile credential generations from the shared database
     logger.info("Starting MLflow OIDC Auth Plugin...")
-    # Every provider is registered independently, so one that is misconfigured or whose
+    # Every provider is reconciled independently, so one that is misconfigured or whose
     # discovery document is unreachable does not disable login for the others (#315).
-    results = ensure_all_clients_registered()
+    results = bootstrap_oidc_clients()
     _oidc_provider_status = results
     registered = [provider_id for provider_id, ok in results.items() if ok]
     failed = [provider_id for provider_id, ok in results.items() if not ok]
@@ -207,6 +207,21 @@ def _include_mlflow_fastapi_routers(oidc_app: FastAPI) -> None:
         logger.info("Included MLflow MCP server registry router (/api/3.0/mlflow/mcp-servers)")
     except ImportError:
         logger.debug("mlflow.server.mcp_server_api not available — MCP registry endpoints disabled")
+
+
+def bootstrap_oidc_clients() -> dict[str, bool]:
+    """Reconcile credential generations from shared state and register their authlib clients.
+
+    Runs at startup (and lazily on first login after a restart): each configured OIDC provider
+    gets an active generation matching the current configuration when it has none, and already
+    published generations are materialised into authlib clients with their pinned credentials. A
+    best-effort sweep then removes generations past their retention window.
+    """
+    from mlflow_oidc_auth.credentials.generations import bootstrap_all, startup_sweep
+
+    results = bootstrap_all()
+    startup_sweep()
+    return results
 
 
 def add_middleware_stack(oidc_app: FastAPI) -> None:
