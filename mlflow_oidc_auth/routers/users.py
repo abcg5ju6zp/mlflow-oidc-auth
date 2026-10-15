@@ -221,17 +221,32 @@ async def create_access_token(
 
 
 def _refuse_tokens_for_external_service_account(username: str) -> None:
-    """No access token is issued for an external service account: its lifecycle lives in its IdP.
+    """No access token is issued for an external service account, nor while its source changes.
+
+    An external account's lifecycle lives in its IdP; a staged source change pins its next
+    generation before revoking the current credentials, so a local token issued in that window
+    would outlive the cutover. Both are refused here (and again in the token repository).
 
     Raises:
-        HTTPException: 409 for an external service account.
+        HTTPException: 409 for an external service account or one with a source change open.
     """
     from mlflow_oidc_auth.utils.service_accounts import is_external
 
     profile = store.get_user_profile(username)
-    if profile.is_service_account is True and is_external(profile.service_account_source):
+    if profile.is_service_account is not True:
+        return
+    if is_external(profile.service_account_source):
         raise HTTPException(
             status_code=409, detail="An external service account signs in with its identity provider's tokens; no access token is issued for it"
+        )
+    transition = store.service_account_transition_repo.get_active(username)
+    if transition is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"This service account has a source change in progress (generation {transition.generation}, "
+                f"phase '{transition.phase}'); no access token is issued until it completes — retry the source change to resume it"
+            ),
         )
 
 
@@ -416,7 +431,7 @@ async def create_new_user(
     HTTPException
         If there is an error creating the user.
     """
-    from mlflow_oidc_auth.utils.service_accounts import INTERNAL_SOURCE, apply_source, validate_source
+    from mlflow_oidc_auth.utils.service_accounts import INTERNAL_SOURCE, bind_new_service_account, validate_source
 
     source = None
     if user_request.is_service_account:
@@ -442,7 +457,9 @@ async def create_new_user(
         )
         if status and source and user_request.subject:
             try:
-                apply_source(user_request.username, source, user_request.subject)
+                # The account was born with its source and has no old credentials — no staged
+                # change is needed; just bind the subject it was created for.
+                bind_new_service_account(user_request.username, source, user_request.subject)
             except Exception:
                 # Never leave an external account behind unbound: its provider's first token
                 # would bind whatever subject it carries.
@@ -1009,25 +1026,33 @@ async def delete_user_identity(
     USER_SERVICE_ACCOUNT_SOURCE,
     summary="Set how a service account signs in",
     description="'internal' (issued access tokens only) or an OIDC provider id, with an optional subject to bind now. "
-    "Becoming external revokes the account's access tokens; changing the source unbinds identities that no longer apply. Admin only.",
+    "The change is staged per identity generation: the target is pinned and new local credentials are refused, "
+    "existing tokens and sessions are revoked, the new source and bindings are published, then caches are invalidated "
+    "and the change audited. A lost response or restart is finished by retrying the same request. Admin only.",
 )
 async def set_service_account_source(
     username: str,
     body: ServiceAccountSourceRequest = Body(...),
     admin_username: str = Depends(check_admin_permission),
 ) -> JSONResponse:
-    """Re-point a service account.
+    """Re-point a service account as a recoverable, generation-tracked operation.
 
     Raises:
         HTTPException: 400 for an unknown source or a subject on an internal account; 404 for an
-            unknown user; 409 for an account that is not a service account.
+            unknown user; 409 for an account that is not a service account, a subject bound to
+            another account, or a different change already in progress; 503 when revocation or
+            publication failed — the same request retried resumes the generation from its phase.
     """
-    from mlflow_oidc_auth.utils.service_accounts import apply_source
+    from mlflow_oidc_auth.utils.service_accounts import (
+        STATUS_FINALIZATION_PENDING,
+        ServiceAccountSourceTransitionError,
+        apply_source,
+    )
 
     if not store.has_user(username):
         raise HTTPException(status_code=404, detail=f"User {username} not found")
     try:
-        apply_source(username, body.source, body.subject)
+        result = apply_source(username, body.source, body.subject, actor=admin_username)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except MlflowException as e:
@@ -1035,12 +1060,39 @@ async def set_service_account_source(
             raise HTTPException(status_code=409, detail=f"{username} is not a service account")
         if e.error_code == ErrorCode.Name(RESOURCE_ALREADY_EXISTS):
             raise HTTPException(status_code=409, detail="That subject is already bound to another account")
+        if e.error_code == ErrorCode.Name(INVALID_STATE):
+            raise HTTPException(status_code=409, detail=str(e.message))
         raise
-    emit_audit_event(
-        "user.service_account_source",
-        actor=admin_username,
-        resource_type="user",
-        resource_id=username,
-        detail={"source": body.source.strip(), "subject_bound": bool(body.subject)},
-    )
-    return JSONResponse(content={"username": username, "service_account_source": body.source.strip()})
+    except ServiceAccountSourceTransitionError as e:
+        # The generation is persisted at ``e.phase`` and the source is not shown as completed.
+        logger.warning("Service account source change for %r generation %s failed at %s", username, e.generation, e.stage)
+        return JSONResponse(
+            status_code=503,
+            content={
+                "username": username,
+                "generation": e.generation,
+                "phase": e.phase,
+                "failed_stage": e.stage,
+                "detail": e.detail,
+                "resume": "retry this same request; the change resumes from the recorded phase",
+            },
+        )
+    if result["status"] == STATUS_FINALIZATION_PENDING:
+        # Published and revoked; only cache invalidation and the audit remain.
+        return JSONResponse(status_code=200, content=_source_change_payload(result, finalization_pending=True))
+    return JSONResponse(content=_source_change_payload(result))
+
+
+def _source_change_payload(result: dict, *, finalization_pending: bool = False) -> dict:
+    """The PUT response body. The audit is emitted inside the staged change, not from the router."""
+    return {
+        "username": result["username"],
+        "service_account_source": result["source"],
+        "generation": result["generation"],
+        "changed": result["changed"],
+        "recovered": result["recovered"],
+        "status": result["status"],
+        "revoked_tokens": result["revoked_tokens"],
+        "revoked_sessions": result["revoked_sessions"],
+        **({"resume": "cache invalidation and audit are pending; retry this same request"} if finalization_pending else {}),
+    }

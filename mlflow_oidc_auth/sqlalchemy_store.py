@@ -66,6 +66,7 @@ from mlflow_oidc_auth.repository import (
     MCPServerPermissionRepository,
     UserRepository,
     UserTokenRepository,
+    ServiceAccountTransitionRepository,
     UserIdentityRepository,
     AuthSessionRepository,
     AuthStateRepository,
@@ -92,6 +93,7 @@ class SqlAlchemyStore:
         self.ManagedSessionMaker = _get_managed_session_maker(SessionMaker, self.db_type)
         self.user_repo = UserRepository(self.ManagedSessionMaker)
         self.user_token_repo = UserTokenRepository(self.ManagedSessionMaker)
+        self.service_account_transition_repo = ServiceAccountTransitionRepository(self.ManagedSessionMaker)
         self.user_identity_repo = UserIdentityRepository(self.ManagedSessionMaker)
         self.auth_session_repo = AuthSessionRepository(self.ManagedSessionMaker, row_locks=self.db_type != "sqlite")
         self.auth_state_repo = AuthStateRepository(self.ManagedSessionMaker)

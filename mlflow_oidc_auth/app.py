@@ -100,6 +100,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             "OIDC authentication will not be available until configuration is corrected."
         )
 
+    # Finish service-account source changes a lost response or a previous process left open.
+    # Each generation resumes from the phase it recorded; a row that still cannot finish is left
+    # for the next sweep and must never stop startup.
+    try:
+        from mlflow_oidc_auth.utils.service_accounts import recover_incomplete
+
+        recover_incomplete()
+    except Exception:
+        logger.exception("Service account source change recovery sweep failed at startup")
+
     yield  # App runs here
 
     # Shutdown: Cleanup if needed

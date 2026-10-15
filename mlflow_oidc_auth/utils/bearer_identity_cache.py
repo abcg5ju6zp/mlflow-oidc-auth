@@ -23,9 +23,24 @@ def bearer_identity_cache() -> CacheBackend:
     return _cache
 
 
-def flush_bearer_identity_cache() -> None:
-    """Drop every cached decision. Never raises: a failure leaves entries to expire by TTL."""
+def invalidate_bearer_identity_cache() -> bool:
+    """Drop every cached decision, reporting whether it worked.
+
+    Unlike :func:`flush_bearer_identity_cache`, this never swallows the outcome into a success:
+    the staged service-account source change treats a failed invalidation as its own, resumable
+    phase. A failure still leaves entries to expire by TTL.
+
+    Returns:
+        Whether the cache backend accepted the clear.
+    """
     try:
         bearer_identity_cache().clear()
+        return True
     except Exception as e:
-        logger.warning("Bearer identity cache flush failed (%s); entries expire via TTL", type(e).__name__)
+        logger.warning("Bearer identity cache invalidation failed (%s); entries expire via TTL", type(e).__name__)
+        return False
+
+
+def flush_bearer_identity_cache() -> None:
+    """Drop every cached decision. Never raises: a failure leaves entries to expire by TTL."""
+    invalidate_bearer_identity_cache()

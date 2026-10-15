@@ -697,6 +697,7 @@ class UserRepository:
                 SqlScorerPermission,
                 SqlScorerRegexPermission,
                 SqlAuthSession,
+                SqlServiceAccountSourceTransition,
                 SqlUserGroup,
                 SqlUserIdentity,
                 SqlWorkspacePermission,
@@ -715,6 +716,10 @@ class UserRepository:
             # user a row here, so without this every account that predates that migration is
             # undeletable: the FK on user_identities.user_id refuses the DELETE.
             session.query(SqlUserIdentity).filter(SqlUserIdentity.user_id == user_id).delete(synchronize_session=False)
+
+            # Staged service-account source changes. Open or historic, the FK requires them gone
+            # before the user row; an open generation dies with the account it referred to.
+            session.query(SqlServiceAccountSourceTransition).filter(SqlServiceAccountSourceTransition.user_id == user_id).delete(synchronize_session=False)
 
             # Experiment permissions
             session.query(SqlExperimentPermission).filter(SqlExperimentPermission.user_id == user_id).delete(synchronize_session=False)

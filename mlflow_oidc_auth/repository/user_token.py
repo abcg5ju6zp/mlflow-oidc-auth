@@ -30,6 +30,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 from mlflow_oidc_auth.db.models import SqlUser, SqlUserToken
 from mlflow_oidc_auth.logger import get_logger
+from mlflow_oidc_auth.repository.service_account_transition import incomplete_transition_exists
 from mlflow_oidc_auth.repository.user import normalize_username
 from mlflow_oidc_auth.repository.utils import get_user
 
@@ -216,6 +217,13 @@ class UserTokenRepository:
             # A deactivated account keeps no credentials; a token issued now would come back to
             # life on reactivation without anyone having issued it to an active user.
             raise MlflowException(f"'{user.username}' is deactivated; tokens cannot be issued", INVALID_STATE)
+        if incomplete_transition_exists(session, user.id):
+            # A staged source change is open: its pin must hold so a credential minted now cannot
+            # survive the cutover, whatever route reaches this repository.
+            raise MlflowException(
+                f"'{user.username}' has a service-account source change in progress; no access token is issued until it completes",
+                INVALID_STATE,
+            )
         # By now ``create`` has refused an existing name and ``replace`` has deleted it, so every
         # remaining row is another live token.
         if session.query(SqlUserToken.id).filter(SqlUserToken.user_id == user.id).count() >= MAX_LIVE_TOKENS_PER_USER:

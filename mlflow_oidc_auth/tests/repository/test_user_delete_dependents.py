@@ -81,6 +81,16 @@ class TestDeleteClearsDependents:
             assert conn.execute(SqlUserToken.__table__.select()).fetchall() == []
         assert store.authenticate_user("tok@example.com", token) is False
 
+    def test_a_service_account_with_an_open_source_transition_can_be_deleted(self, store):
+        """The transition table references users.id; an open generation must not pin the account."""
+        store.create_user("ci-bot", "CI", is_service_account=True, service_account_source="internal")
+        store.service_account_transition_repo.begin("ci-bot", "partner", None, "root@example.com")
+
+        store.delete_user("ci-bot")
+
+        assert store.has_user("ci-bot") is False
+        assert store.service_account_transition_repo.list_incomplete() == []
+
     def test_deleting_an_unknown_user_still_raises(self, store):
         """The fix must not turn a missing user into a silent success."""
         with pytest.raises(MlflowException):
@@ -108,6 +118,7 @@ class TestEveryForeignKeyToUsersIsCovered:
             "user_identities",
             "auth_sessions",
             "user_tokens",
+            "service_account_source_transitions",
             "experiment_permissions",
             "experiment_regex_permissions",
             "registered_model_permissions",
